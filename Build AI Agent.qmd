@@ -16,9 +16,8 @@ library(ggplot2)
 library(lubridate)
 ```
 
-
 ```{r}
-# Step 1: Read .Renviron to get the API key
+# Step 1: Read .API.Renviron.sh to get the API key
 if (file.exists(".Renviron")) {
   readRenviron(".Renviron")
 }
@@ -26,7 +25,7 @@ api_key <- Sys.getenv("PURPLEAIR_API_KEY")
 
 # Check if API key is available
 if (api_key == "") {
-  stop("❌ PURPLEAIR_API_KEY not found in environment variables. Please set it in .Renviron file.")
+  stop("❌ PURPLEAIR_API_KEY not found in environment variables. Please set it in ..Renviron file.")
 }
 
 # Step 2: Function to convert ZIP code to Lat/Lon and get city name
@@ -345,6 +344,7 @@ get_quick_air_quality <- function(zipcode) {
 ```{r}
 result <- get_quick_air_quality("90015")
 ```
+
 ```{r}
 # Enhanced air quality function for addresses (based on your existing function)
 get_air_quality_by_address <- function(address, search_radius_deg = 0.05) {
@@ -1407,7 +1407,7 @@ get_latlon_from_address("700 W 9th St,Los Angeles,CA")
 result <- get_air_quality_with_aqi_by_address("700 W 9th St,Los Angeles,CA")
 ```
 
-# Part 2 # Buile AI agent LLM
+# Part 2 \# Buile AI agent LLM
 
 ```{r}
 # ==== env ====
@@ -2397,16 +2397,14 @@ cat('   result <- get_health_recommendations_by_address("700 W 9th St,Los Angele
 cat('   health_consultation_by_address("Your Address", "Is jogging safe today?")\n')
 cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 ```
+
 ```{r}
 result <- get_health_recommendations_by_address("700 W 9th St,Los Angeles,CA")
 ```
+
 # Part 3 - Agent Conversation"
 
 ```{r}
-# ============================== 
-# Interactive Health AI Agent - Conversational Web Interface
-# ============================== 
-
 library(shiny)
 library(shinydashboard)
 library(shinyjs)
@@ -2552,31 +2550,42 @@ Be conversational, empathetic, and concise. Focus on actionable advice.",
 
 ui <- dashboardPage(
   skin = "blue",
-  
+
+  # ---------------------- Header ----------------------
   dashboardHeader(
-    title = "🏥 Dr. Claude - AI Health Advisor",
+    title = "🩺 AI Health Advisor",
     titleWidth = 350
   ),
-  
+
+  # ---------------------- Sidebar ----------------------
   dashboardSidebar(
     width = 300,
+
     sidebarMenu(
-      menuItem("💬 Chat", tabName = "chat", icon = icon("comments")),
-      menuItem("📍 Location", tabName = "location", icon = icon("map-marker-alt")),
-      menuItem("👤 Profile", tabName = "profile", icon = icon("user"))
+      menuItem("Chat",      tabName = "chat",      icon = icon("comments")),
+      menuItem("Location",  tabName = "location",  icon = icon("map-marker-alt")),
+      menuItem("Profile",   tabName = "profile",   icon = icon("user"))
     ),
-    
+
     hr(),
-    
-    # Quick location input in sidebar
-    textInput("quick_location", "📍 Location (ZIP/Address)", 
-             placeholder = "90210 or 123 Main St"),
-    actionButton("update_location_btn", "Update Location", 
-                class = "btn-primary btn-block"),
-    
+
+    # ------------------ Quick location input ------------------
+    textInput(
+      inputId = "quick_location",
+      label = "📍 Location (ZIP/Address)",
+      placeholder = "90210 or 123 Main St"
+    ),
+
+    actionButton(
+      inputId = "update_location_btn",
+      label = "Update Location",
+      class = "btn btn-primary",
+      style = "width:150px; white-space:nowrap; display:inline-block;"
+    ),
+
     hr(),
-    
-    # Current conditions display
+
+    # ------------------ Current conditions display ------------------
     h4("Current Conditions", style = "padding-left: 15px;"),
     uiOutput("sidebar_conditions")
   ),
@@ -2969,7 +2978,13 @@ server <- function(input, output, session) {
 }
 
 # Run App
-# ============================== 
+# ============================= 
 
 shinyApp(ui = ui, server = server)
+
 ```
+
+
+
+
+

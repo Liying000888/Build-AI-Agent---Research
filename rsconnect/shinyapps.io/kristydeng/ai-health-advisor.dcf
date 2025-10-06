@@ -1,0 +1,10 @@
+name: ai-health-advisor
+title: AI Health Advisor
+username: kristydeng
+account: kristydeng
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15665550
+bundleId: 10996779
+url: https://kristydeng.shinyapps.io/ai-health-advisor/
+version: 1
