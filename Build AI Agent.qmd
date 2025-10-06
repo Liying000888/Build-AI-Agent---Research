@@ -1,0 +1,2975 @@
+---
+title: "Build AI Agent"
+format: html
+---
+
+```{r,echo=false}
+library(shiny)
+library(shinydashboard)
+library(DT)
+library(plotly)
+library(leaflet)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+```
+
+
+```{r}
+# Step 1: Read .Renviron to get the API key
+if (file.exists(".Renviron")) {
+  readRenviron(".Renviron")
+}
+api_key <- Sys.getenv("PURPLEAIR_API_KEY")
+
+# Check if API key is available
+if (api_key == "") {
+  stop("❌ PURPLEAIR_API_KEY not found in environment variables. Please set it in .Renviron file.")
+}
+
+# Step 2: Function to convert ZIP code to Lat/Lon and get city name
+get_latlon_from_zip <- function(zipcode) {
+  # Using a more reliable geocoding service with detailed address info
+  url <- paste0("https://nominatim.openstreetmap.org/search")
+  
+  res <- GET(url, query = list(
+    q = paste(zipcode, "USA"),
+    format = "json",
+    countrycodes = "us",
+    limit = 1,
+    addressdetails = 1
+  ))
+  
+  if (status_code(res) != 200) {
+    stop("❌ Invalid ZIP code or failed to connect to geocoding API.")
+  }
+  
+  data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  
+  if (length(data) == 0) {
+    stop(paste("❌ No location found for ZIP code:", zipcode))
+  }
+  
+  lat <- as.numeric(data[1, "lat"])
+  lon <- as.numeric(data[1, "lon"])
+  
+  # Extract city and state information
+  address <- data[1, "address"]
+  city <- ""
+  state <- ""
+  
+  if (!is.null(address)) {
+    # Try different address components for city name
+    city_options <- c("city", "town", "village", "hamlet", "suburb", "neighbourhood")
+    for (option in city_options) {
+      if (!is.null(address[[option]]) && address[[option]] != "") {
+        city <- address[[option]]
+        break
+      }
+    }
+    
+    # Get state
+    if (!is.null(address$state)) {
+      state <- address$state
+    }
+  }
+  
+  # If no city found in address, use display_name
+  if (city == "" && !is.null(data[1, "display_name"])) {
+    display_parts <- strsplit(data[1, "display_name"], ",")[[1]]
+    if (length(display_parts) >= 2) {
+      city <- trimws(display_parts[2])  # Usually the second part is city
+    }
+  }
+  
+  # Create location name
+  if (city != "" && state != "") {
+    location_name <- paste(city, state, sep = ", ")
+  } else if (city != "") {
+    location_name <- city
+  } else {
+    location_name <- paste("ZIP", zipcode)
+  }
+  
+  return(list(
+    lat = lat, 
+    lon = lon, 
+    city = city,
+    state = state,
+    location_name = location_name,
+    zipcode = zipcode
+  ))
+}
+```
+
+```{r}
+# Step 3: Function to get air quality data
+get_air_quality <- function(location) {
+  
+  # Handle both ZIP code and coordinates
+  if (is.character(location)) {
+    location_info <- get_latlon_from_zip(location)
+    coords <- c(lat = location_info$lat, lon = location_info$lon)
+    cat(sprintf("📍 ZIP %s -> %s (%.4f, %.4f)\n", 
+                location, location_info$location_name, coords["lat"], coords["lon"]))
+    location_name <- location_info$location_name
+  } else {
+    coords <- location # assume it's c(lat, lon)
+    cat(sprintf("📍 Using coordinates: %.4f, %.4f\n", coords["lat"], coords["lon"]))
+    location_name <- "Custom Coordinates"
+  }
+  
+  # Build Purple Air API URL with proper parameters
+  #This builds a bounding box for the PurpleAir API. You start with the center point coords = c(lat, lon) and expand it into a small rectangle by adding/subtracting ±0.05 degrees in latitude/longitude:
+# nwlat = lat + 0.05: go north (latitude increases)
+# nwlng = lon - 0.05: go west (longitude decreases; in the Americas longitudes are negative, so subtracting 0.05 moves “further west”)
+# selat = lat - 0.05: go south (latitude decreases)
+# selng = lon + 0.05: go east (longitude increases)
+  
+  url <- paste0(
+    "https://api.purpleair.com/v1/sensors?",
+    "fields=sensor_index,name,latitude,longitude,pm2.5_atm,pm2.5_cf_1,pm10.0_atm,pm10.0_cf_1,temperature,humidity,pressure,last_seen,date_created&",
+    sprintf("nwlng=%.6f&", coords["lon"] - 0.05),  # Smaller search area for better results
+    sprintf("nwlat=%.6f&", coords["lat"] + 0.05),
+    sprintf("selng=%.6f&", coords["lon"] + 0.05),
+    sprintf("selat=%.6f&", coords["lat"] - 0.05),
+    "max_age=3600&",  # Data from last hour
+    "location_type=0"  # Outdoor sensors only
+  )
+  
+  # Make API request with proper headers
+  res <- GET(url, add_headers("X-API-Key" = api_key))
+  
+  if (status_code(res) != 200) {
+    cat(sprintf("❌ API Error: Status code %d\n", status_code(res)))
+    error_content <- content(res, "text")
+    cat(sprintf("Error details: %s\n", error_content))
+    stop("Failed to connect to PurpleAir API.")
+  }
+  
+  result <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  
+  # Check if any sensors were found
+  if (is.null(result$data) || length(result$data) == 0) {
+    warning("⚠️ No sensors found near this location.")
+    return(list(pm25 = NA, pm10 = NA, temperature = NA, humidity = NA, sensor_count = 0))
+  }
+  
+  # Convert to dataframe
+  if (is.matrix(result$data)) {
+    df <- as.data.frame(result$data, stringsAsFactors = FALSE)
+  } else {
+    df <- as.data.frame(do.call(rbind, result$data), stringsAsFactors = FALSE)
+  }
+  
+  # Set column names
+  colnames(df) <- result$fields
+  
+  # Convert numeric columns
+  numeric_cols <- c("sensor_index", "latitude", "longitude", "pm2.5_atm", "pm2.5_cf_1", 
+                   "pm10.0_atm", "pm10.0_cf_1", "temperature", "humidity", "pressure", "last_seen")
+  
+  for (col in numeric_cols) {
+    if (col %in% colnames(df)) {
+      df[[col]] <- as.numeric(df[[col]])
+    }
+  }
+  
+  # Filter out invalid values (negative or extremely high readings)
+  df <- df[!is.na(df$pm2.5_atm) & df$pm2.5_atm >= 0 & df$pm2.5_atm < 1000, ]
+  
+  if (nrow(df) == 0) {
+    warning("⚠️ All sensors returned invalid values.")
+    return(list(pm25 = NA, pm10 = NA, temperature = NA, humidity = NA, sensor_count = 0))
+  }
+  
+  # Calculate average values from all valid sensors
+  avg_pm25 <- round(mean(df$pm2.5_atm, na.rm = TRUE), 1)
+  avg_pm10 <- round(mean(df$pm10.0_atm, na.rm = TRUE), 1)
+  avg_temp <- round(mean(df$temperature, na.rm = TRUE), 1)
+  avg_humidity <- round(mean(df$humidity, na.rm = TRUE), 1)
+  
+  # Also return the most recent sensor data
+  most_recent_idx <- which.max(df$last_seen)
+  best_sensor <- df[most_recent_idx, ]
+  
+  cat(sprintf("✅ Found %d valid sensors\n", nrow(df)))
+  cat(sprintf("📊 Average PM2.5: %.1f μg/m³\n", avg_pm25))
+  cat(sprintf("📊 Average PM10: %.1f μg/m³\n", avg_pm10))
+  cat(sprintf("🌡️ Average Temperature: %.1f°F\n", avg_temp))
+  cat(sprintf("💧 Average Humidity: %.1f%%\n", avg_humidity))
+  
+  return(list(
+    # Average values
+    pm25_avg = avg_pm25,
+    pm10_avg = avg_pm10,
+    temperature_avg = avg_temp,
+    humidity_avg = avg_humidity,
+    
+    # Most recent sensor values
+    pm25_recent = round(best_sensor$pm2.5_atm, 1),
+    pm10_recent = round(best_sensor$pm10.0_atm, 1),
+    temperature_recent = round(best_sensor$temperature, 1),
+    humidity_recent = round(best_sensor$humidity, 1),
+    
+    # Metadata
+    sensor_count = nrow(df),
+    coordinates = coords,
+    location_name = if(exists("location_name")) location_name else "Unknown",
+    sensors_data = df,
+    most_recent_sensor = best_sensor
+  ))
+}
+```
+
+```{r}
+# Step 4: Enhanced function with AQI calculation
+calculate_aqi_pm25 <- function(pm25) {
+  # Calculate AQI based on PM2.5 concentration
+  # Using EPA AQI breakpoints
+  if (is.na(pm25)) return(NA)
+  
+  if (pm25 <= 12.0) {
+    aqi <- (50 - 0) / (12.0 - 0) * (pm25 - 0) + 0
+    category <- "Good"
+  } else if (pm25 <= 35.4) {
+    aqi <- (100 - 51) / (35.4 - 12.1) * (pm25 - 12.1) + 51
+    category <- "Moderate"
+  } else if (pm25 <= 55.4) {
+    aqi <- (150 - 101) / (55.4 - 35.5) * (pm25 - 35.5) + 101
+    category <- "Unhealthy for Sensitive Groups"
+  } else if (pm25 <= 150.4) {
+    aqi <- (200 - 151) / (150.4 - 55.5) * (pm25 - 55.5) + 151
+    category <- "Unhealthy"
+  } else if (pm25 <= 250.4) {
+    aqi <- (300 - 201) / (250.4 - 150.5) * (pm25 - 150.5) + 201
+    category <- "Very Unhealthy"
+  } else {
+    aqi <- (500 - 301) / (500.4 - 250.5) * (pm25 - 250.5) + 301
+    category <- "Hazardous"
+  }
+  
+  return(list(aqi = round(aqi), category = category))
+}
+
+# Enhanced air quality function with AQI
+get_air_quality_with_aqi <- function(location) {
+  result <- get_air_quality(location)
+  
+  if (is.na(result$pm25_avg)) {
+    return(result)
+  }
+  
+  # Calculate AQI
+  aqi_info <- calculate_aqi_pm25(result$pm25_avg)
+  result$aqi <- aqi_info$aqi
+  result$aqi_category <- aqi_info$category
+  
+  cat(sprintf("🏷️ AQI: %d (%s)\n", result$aqi, result$aqi_category))
+  
+  return(result)
+}
+
+# Step 5: Example usage with automatic city name detection
+# Example 1: Use ZIP code (will automatically show city name)
+cat("=== Example 1: Using ZIP code (auto-detects city) ===\n")
+zip_result <- get_air_quality_with_aqi("90210")
+```
+
+```{r}
+# Example 2: Try different ZIP codes
+cat("\n=== Testing different ZIP codes ===\n")
+test_zipcodes <- c("10001", "94102", "33101")  # NYC, SF, Miami
+for (zip in test_zipcodes) {
+  cat(sprintf("\n--- Testing ZIP: %s ---\n", zip))
+  tryCatch({
+    result <- get_air_quality_with_aqi(zip)
+    if (!is.na(result$pm25_avg)) {
+      summary <- create_air_quality_summary(result, result$location_name)
+      cat(summary, "\n")
+    }
+  }, error = function(e) {
+    cat(sprintf("❌ Error for ZIP %s: %s\n", zip, e$message))
+  })
+}
+
+# Step 6: Create summary function
+create_air_quality_summary <- function(result, location_name = "Unknown") {
+  if (is.na(result$pm25_avg)) {
+    return(sprintf("No valid air quality data available for %s", location_name))
+  }
+  summary_text <- sprintf(
+    "📍 Location: %s
+🔢 Sensors: %d active sensors found
+📊 PM2.5: %.1f μg/m³ (AQI: %d - %s)
+📊 PM10: %.1f μg/m³
+🌡️ Temperature: %.1f°F
+💧 Humidity: %.1f%%
+📅 Data timestamp: %s",
+    location_name,
+    result$sensor_count,
+    result$pm25_avg, result$aqi, result$aqi_category,
+    result$pm10_avg,
+    result$temperature_avg,
+    result$humidity_avg,
+    Sys.time()
+  )
+  
+  return(summary_text)
+}
+# Example summary using automatic location name
+if (exists("zip_result") && !is.na(zip_result$pm25_avg)) {
+  cat("\n=== Air Quality Summary ===\n")
+  summary <- create_air_quality_summary(zip_result, zip_result$location_name)
+  cat(summary)
+}
+
+# Quick function for single ZIP code query with city name
+get_quick_air_quality <- function(zipcode) {
+  cat(sprintf("🔍 Querying air quality for ZIP code: %s\n", zipcode))
+  result <- get_air_quality_with_aqi(zipcode)
+  
+  if (!is.na(result$pm25_avg)) {
+    summary <- create_air_quality_summary(result, result$location_name)
+    cat("\n", summary, "\n")
+    return(result)
+  } else {
+    cat(sprintf("❌ No air quality data found for ZIP %s\n", zipcode))
+    return(NULL)
+  }
+}
+```
+
+```{r}
+result <- get_quick_air_quality("90015")
+```
+```{r}
+# Enhanced air quality function for addresses (based on your existing function)
+get_air_quality_by_address <- function(address, search_radius_deg = 0.05) {
+  cat(sprintf("🏠 Getting air quality for address: %s\n", address))
+  
+  # Step 1: Geocode the address
+  location_info <- get_latlon_from_address(address)
+  
+  if (is.null(location_info)) {
+    warning("❌ Could not geocode address")
+    return(list(pm25_avg = NA, pm10_avg = NA, temperature_avg = NA, humidity_avg = NA, sensor_count = 0))
+  }
+  
+  # Step 2: Use coordinates to get air quality (reusing your existing logic)
+  coords <- c(lat = location_info$lat, lon = location_info$lon)
+  cat(sprintf("📍 Address -> %s (%.6f, %.6f)\n", 
+              location_info$location_name, coords["lat"], coords["lon"]))
+  
+  # Build Purple Air API URL (same as your existing function)
+  url <- paste0(
+    "https://api.purpleair.com/v1/sensors?",
+    "fields=sensor_index,name,latitude,longitude,pm2.5_atm,pm2.5_cf_1,pm10.0_atm,pm10.0_cf_1,temperature,humidity,pressure,last_seen,date_created&",
+    sprintf("nwlng=%.6f&", coords["lon"] - search_radius_deg),
+    sprintf("nwlat=%.6f&", coords["lat"] + search_radius_deg),
+    sprintf("selng=%.6f&", coords["lon"] + search_radius_deg),
+    sprintf("selat=%.6f&", coords["lat"] - search_radius_deg),
+    "max_age=3600&",
+    "location_type=0"
+  )
+  
+  # Make API request (same as your existing function)
+  res <- GET(url, add_headers("X-API-Key" = api_key))
+  
+  if (status_code(res) != 200) {
+    cat(sprintf("❌ API Error: Status code %d\n", status_code(res)))
+    error_content <- content(res, "text")
+    cat(sprintf("Error details: %s\n", error_content))
+    stop("Failed to connect to PurpleAir API.")
+  }
+  
+  result <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  
+  # Process data (same logic as your existing function)
+  if (is.null(result$data) || length(result$data) == 0) {
+    warning("⚠️ No sensors found near this address.")
+    return(list(pm25_avg = NA, pm10_avg = NA, temperature_avg = NA, humidity_avg = NA, sensor_count = 0))
+  }
+  
+  # Convert to dataframe (same as your existing function)
+  if (is.matrix(result$data)) {
+    df <- as.data.frame(result$data, stringsAsFactors = FALSE)
+  } else {
+    df <- as.data.frame(do.call(rbind, result$data), stringsAsFactors = FALSE)
+  }
+  
+  colnames(df) <- result$fields
+  
+  # Convert numeric columns
+  numeric_cols <- c("sensor_index", "latitude", "longitude", "pm2.5_atm", "pm2.5_cf_1", 
+                   "pm10.0_atm", "pm10.0_cf_1", "temperature", "humidity", "pressure", "last_seen")
+  
+  for (col in numeric_cols) {
+    if (col %in% colnames(df)) {
+      df[[col]] <- as.numeric(df[[col]])
+    }
+  }
+  
+  # Filter out invalid values
+  df <- df[!is.na(df$pm2.5_atm) & df$pm2.5_atm >= 0 & df$pm2.5_atm < 1000, ]
+  
+  if (nrow(df) == 0) {
+    warning("⚠️ All sensors returned invalid values.")
+    return(list(pm25_avg = NA, pm10_avg = NA, temperature_avg = NA, humidity_avg = NA, sensor_count = 0))
+  }
+  
+  # Calculate averages (same as your existing function)
+  avg_pm25 <- round(mean(df$pm2.5_atm, na.rm = TRUE), 1)
+  avg_pm10 <- round(mean(df$pm10.0_atm, na.rm = TRUE), 1)
+  avg_temp <- round(mean(df$temperature, na.rm = TRUE), 1)
+  avg_humidity <- round(mean(df$humidity, na.rm = TRUE), 1)
+  
+  # Most recent sensor data
+  most_recent_idx <- which.max(df$last_seen)
+  best_sensor <- df[most_recent_idx, ]
+  
+  cat(sprintf("✅ Found %d valid sensors\n", nrow(df)))
+  cat(sprintf("📊 Average PM2.5: %.1f μg/m³\n", avg_pm25))
+  cat(sprintf("📊 Average PM10: %.1f μg/m³\n", avg_pm10))
+  cat(sprintf("🌡️ Average Temperature: %.1f°F\n", avg_temp))
+  cat(sprintf("💧 Average Humidity: %.1f%%\n", avg_humidity))
+  
+  return(list(
+    # Average values
+    pm25_avg = avg_pm25,
+    pm10_avg = avg_pm10,
+    temperature_avg = avg_temp,
+    humidity_avg = avg_humidity,
+    
+    # Most recent sensor values
+    pm25_recent = round(best_sensor$pm2.5_atm, 1),
+    pm10_recent = round(best_sensor$pm10.0_atm, 1),
+    temperature_recent = round(best_sensor$temperature, 1),
+    humidity_recent = round(best_sensor$humidity, 1),
+    
+    # Metadata
+    sensor_count = nrow(df),
+    coordinates = coords,
+    location_name = location_info$location_name,
+    formatted_address = location_info$formatted_address,
+    original_address = address,
+    geocoding_info = location_info,
+    sensors_data = df,
+    most_recent_sensor = best_sensor
+  ))
+}
+
+# Your existing AQI calculation function (keeping it exactly as is)
+calculate_aqi_pm25 <- function(pm25) {
+  # Calculate AQI based on PM2.5 concentration
+  # Using EPA AQI breakpoints
+  if (is.na(pm25)) return(NA)
+  
+  if (pm25 <= 12.0) {
+    aqi <- (50 - 0) / (12.0 - 0) * (pm25 - 0) + 0
+    category <- "Good"
+  } else if (pm25 <= 35.4) {
+    aqi <- (100 - 51) / (35.4 - 12.1) * (pm25 - 12.1) + 51
+    category <- "Moderate"
+  } else if (pm25 <= 55.4) {
+    aqi <- (150 - 101) / (55.4 - 35.5) * (pm25 - 35.5) + 101
+    category <- "Unhealthy for Sensitive Groups"
+  } else if (pm25 <= 150.4) {
+    aqi <- (200 - 151) / (150.4 - 55.5) * (pm25 - 55.5) + 151
+    category <- "Unhealthy"
+  } else if (pm25 <= 250.4) {
+    aqi <- (300 - 201) / (250.4 - 150.5) * (pm25 - 150.5) + 201
+    category <- "Very Unhealthy"
+  } else {
+    aqi <- (500 - 301) / (500.4 - 250.5) * (pm25 - 250.5) + 301
+    category <- "Hazardous"
+  }
+  
+  return(list(aqi = round(aqi), category = category))
+}
+
+# Your existing enhanced function (keeping it as is)
+get_air_quality_with_aqi <- function(location) {
+  result <- get_air_quality(location)
+  
+  if (is.na(result$pm25_avg)) {
+    return(result)
+  }
+  
+  # Calculate AQI
+  aqi_info <- calculate_aqi_pm25(result$pm25_avg)
+  result$aqi <- aqi_info$aqi
+  result$aqi_category <- aqi_info$category
+  
+  cat(sprintf("🏷️ AQI: %d (%s)\n", result$aqi, result$aqi_category))
+  
+  return(result)
+}
+
+# NEW: Enhanced function for addresses with AQI
+get_air_quality_with_aqi_by_address <- function(address, search_radius_deg = 0.05) {
+  result <- get_air_quality_by_address(address, search_radius_deg)
+  
+  if (is.na(result$pm25_avg)) {
+    return(result)
+  }
+  
+  # Calculate AQI
+  aqi_info <- calculate_aqi_pm25(result$pm25_avg)
+  result$aqi <- aqi_info$aqi
+  result$aqi_category <- aqi_info$category
+  
+  cat(sprintf("🏷️ AQI: %d (%s)\n", result$aqi, result$aqi_category))
+  
+  return(result)
+}
+
+# Convenience function to create air quality summary
+create_air_quality_summary <- function(air_data, location_description = NULL) {
+  if (is.null(location_description)) {
+    location_description <- air_data$location_name %||% "Unknown Location"
+  }
+  
+  summary <- sprintf(
+    "🌍 AIR QUALITY SUMMARY: %s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 PM2.5: %.1f μg/m³ | AQI: %d (%s)
+📊 PM10: %.1f μg/m³ 
+🌡️ Temperature: %.1f°F | 💧 Humidity: %.1f%%
+📡 Data from %d sensors
+📍 Coordinates: %.4f°N, %.4f°W
+⏰ Retrieved: %s",
+    location_description,
+    air_data$pm25_avg %||% 0,
+    air_data$aqi %||% 0,
+    air_data$aqi_category %||% "Unknown",
+    air_data$pm10_avg %||% 0,
+    air_data$temperature_avg %||% 0,
+    air_data$humidity_avg %||% 0,
+    air_data$sensor_count %||% 0,
+    air_data$coordinates["lat"] %||% 0,
+    air_data$coordinates["lon"] %||% 0,
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  )
+  
+  return(summary)
+}
+```
+
+```{r}
+# ============================== Testing and Demo Functions ==============================
+
+# Test geocoding function
+test_address_geocoding <- function(address = "1600 Pennsylvania Avenue NW, Washington, DC") {
+  cat("🧪 Testing address geocoding...\n")
+  cat(sprintf("📍 Test address: %s\n", address))
+  cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+  
+  result <- get_latlon_from_address(address)
+  
+  if (!is.null(result)) {
+    cat("\n✅ Geocoding successful!\n")
+    cat(sprintf("📍 Coordinates: %.6f°N, %.6f°W\n", result$lat, result$lon))
+    cat(sprintf("🏙️ Location: %s\n", result$location_name))
+    cat(sprintf("📮 Formatted: %s\n", result$formatted_address))
+  } else {
+    cat("\n❌ Geocoding failed!\n")
+  }
+  
+  return(result)
+}
+
+# Test air quality by address
+test_air_quality_by_address <- function(address = "1600 Pennsylvania Avenue NW, Washington, DC") {
+  cat("🧪 Testing air quality by address...\n")
+  cat(sprintf("🏠 Test address: %s\n", address))
+  cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+  
+  tryCatch({
+    result <- get_air_quality_with_aqi_by_address(address)
+    
+    if (!is.na(result$pm25_avg)) {
+      summary <- create_air_quality_summary(result, result$formatted_address)
+      cat(summary, "\n")
+      return(result)
+    } else {
+      cat("❌ No valid air quality data found for this address\n")
+      return(NULL)
+    }
+  }, error = function(e) {
+    cat(sprintf("❌ Error: %s\n", e$message))
+    return(NULL)
+  })
+}
+
+# Compare ZIP code vs Address results
+compare_zip_vs_address <- function(zipcode, address) {
+  cat("🔍 COMPARISON: ZIP CODE vs ADDRESS\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n")
+  
+  cat(sprintf("📮 ZIP Code: %s\n", zipcode))
+  cat(sprintf("🏠 Address: %s\n\n", address))
+  
+  # Test ZIP code
+  cat("1. Testing ZIP Code Method:\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  zip_result <- tryCatch({
+    get_air_quality_with_aqi(zipcode)
+  }, error = function(e) {
+    cat(sprintf("❌ ZIP code error: %s\n", e$message))
+    NULL
+  })
+  
+  cat("\n2. Testing Address Method:\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  address_result <- tryCatch({
+    get_air_quality_with_aqi_by_address(address)
+  }, error = function(e) {
+    cat(sprintf("❌ Address error: %s\n", e$message))
+    NULL
+  })
+  
+  # Compare results
+  cat("\n3. Comparison Results:\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  
+  if (!is.null(zip_result) && !is.null(address_result) && 
+      !is.na(zip_result$pm25_avg) && !is.na(address_result$pm25_avg)) {
+    
+    cat(sprintf("📊 PM2.5 - ZIP: %.1f μg/m³ | Address: %.1f μg/m³ | Difference: %.1f\n",
+               zip_result$pm25_avg, address_result$pm25_avg, 
+               abs(zip_result$pm25_avg - address_result$pm25_avg)))
+    
+    cat(sprintf("🏷️ AQI - ZIP: %d (%s) | Address: %d (%s)\n",
+               zip_result$aqi, zip_result$aqi_category,
+               address_result$aqi, address_result$aqi_category))
+    
+    cat(sprintf("📡 Sensors - ZIP: %d | Address: %d\n",
+               zip_result$sensor_count, address_result$sensor_count))
+    
+    cat(sprintf("📍 Distance between coordinates: %.4f km\n",
+               distHaversine(c(zip_result$coordinates["lon"], zip_result$coordinates["lat"]),
+                           c(address_result$coordinates["lon"], address_result$coordinates["lat"])) / 1000))
+  } else {
+    cat("❌ Unable to compare - one or both methods failed\n")
+  }
+  
+  return(list(zip_result = zip_result, address_result = address_result))
+}
+
+# Helper function for distance calculation (simple Haversine)
+distHaversine <- function(p1, p2) {
+  # p1 and p2 are c(lon, lat) in degrees
+  toRad <- pi/180
+  R <- 6371000  # Earth radius in meters
+  
+  dLat <- (p2[2] - p1[2]) * toRad
+  dLon <- (p1[1] - p2[1]) * toRad
+  
+  a <- sin(dLat/2)^2 + cos(p1[2] * toRad) * cos(p2[2] * toRad) * sin(dLon/2)^2
+  c <- 2 * atan2(sqrt(a), sqrt(1-a))
+  
+  return(R * c)
+}
+
+# Enhanced demo function
+run_address_demo <- function() {
+  cat("🎯 ENHANCED AIR QUALITY DEMO - ADDRESS SUPPORT\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+  
+  # Test addresses
+  test_addresses <- c(
+    "1600 Pennsylvania Avenue NW, Washington, DC",
+    "Times Square, New York, NY",
+    "Hollywood Boulevard, Los Angeles, CA"
+  )
+  
+  results <- list()
+  
+  for (i in seq_along(test_addresses)) {
+    cat(sprintf("Demo %d: Testing %s\n", i, test_addresses[i]))
+    cat("─────────────────────────────────────────────────────────────────────────────────\n")
+    
+    result <- test_air_quality_by_address(test_addresses[i])
+    results[[i]] <- result
+    
+    cat("\n")
+  }
+  
+  return(results)
+}
+
+# ============================== Main Usage Examples ==============================
+
+cat("\n🏠 ENHANCED AIR QUALITY MODULE WITH ADDRESS SUPPORT LOADED!\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("📋 Available Functions:\n")
+cat("🔹 get_air_quality_with_aqi_by_address('1600 Pennsylvania Ave, DC') - Get air quality by address\n")
+cat("🔹 test_address_geocoding('Your Address Here') - Test geocoding\n")
+cat("🔹 test_air_quality_by_address('Your Address Here') - Test air quality\n")
+cat("🔹 compare_zip_vs_address('20500', '1600 Pennsylvania Ave, DC') - Compare methods\n")
+cat("🔹 run_address_demo() - Run demo with multiple addresses\n")
+cat("🔹 create_air_quality_summary(result) - Create formatted summary\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("💡 Example Usage:\n")
+cat('   result <- get_air_quality_with_aqi_by_address("123 Main St, Los Angeles, CA")\n')
+cat('   summary <- create_air_quality_summary(result)\n')
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    # ==== Enhanced Air Quality with Address Support ====
+# This module extends your existing ZIP code system to support detailed addresses
+
+# Load required libraries (same as your existing code)
+suppressPackageStartupMessages({
+  library(httr)
+  library(jsonlite)
+  library(R6)
+})
+
+# Read environment variables (same as your existing code)
+if (file.exists(".Renviron")) {
+  readRenviron(".Renviron")
+}
+api_key <- Sys.getenv("PURPLEAIR_API_KEY")
+
+# Check if API key is available
+if (api_key == "") {
+  stop("❌ PURPLEAIR_API_KEY not found in environment variables. Please set it in .Renviron file.")
+}
+
+# ==== Enhanced Geocoding Functions ====
+
+# Function to geocode detailed address (improved from your ZIP code geocoding)
+get_latlon_from_address <- function(address, timeout = 30) {
+  cat(sprintf("🌍 Geocoding address: %s\n", address))
+  
+  # Clean and encode the address
+  clean_address <- URLencode(trimws(address), reserved = TRUE)
+  
+  # Using Nominatim (same as your ZIP code function but for full addresses)
+  url <- "https://nominatim.openstreetmap.org/search"
+  
+  tryCatch({
+    res <- GET(url, 
+               query = list(
+                 q = address,
+                 format = "json",
+                 limit = 1,
+                 addressdetails = 1
+               ),
+               add_headers("User-Agent" = "R Healthcare AI Agent/1.0"),
+               timeout(timeout))
+    
+    if (status_code(res) != 200) {
+      cat(sprintf("❌ Geocoding failed with status: %d\n", status_code(res)))
+      return(NULL)
+    }
+    
+    data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+    
+    if (length(data) == 0) {
+      cat("❌ No location found for this address\n")
+      return(NULL)
+    }
+    
+    lat <- as.numeric(data[1, "lat"])
+    lon <- as.numeric(data[1, "lon"])
+    
+    # Extract address information (similar to your ZIP code function)
+    address_info <- data[1, "address"]
+    city <- ""
+    state <- ""
+    
+    if (!is.null(address_info)) {
+      # Try different address components for city name
+      city_options <- c("city", "town", "village", "hamlet", "suburb", "neighbourhood")
+      for (option in city_options) {
+        if (!is.null(address_info[[option]]) && address_info[[option]] != "") {
+          city <- address_info[[option]]
+          break
+        }
+      }
+      
+      # Get state
+      if (!is.null(address_info$state)) {
+        state <- address_info$state
+      }
+    }
+    
+    # Create location name
+    if (city != "" && state != "") {
+      location_name <- paste(city, state, sep = ", ")
+    } else if (city != "") {
+      location_name <- city
+    } else {
+      # Use first part of display name if no city found
+      display_parts <- strsplit(data[1, "display_name"], ",")[[1]]
+      if (length(display_parts) >= 1) {
+        location_name <- trimws(display_parts[1])
+      } else {
+        location_name <- "Unknown Location"
+      }
+    }
+    
+    cat(sprintf("✅ Geocoded successfully: %.6f°N, %.6f°W\n", lat, lon))
+    cat(sprintf("📍 Location: %s\n", location_name))
+    
+    return(list(
+      lat = lat,
+      lon = lon,
+      city = city,
+      state = state,
+      location_name = location_name,
+      formatted_address = data[1, "display_name"],
+      original_address = address
+    ))
+    
+  }, error = function(e) {
+    cat(sprintf("❌ Geocoding error: %s\n", e$message))
+    return(NULL)
+  })
+}
+
+# Your existing ZIP code function (keeping it for backward compatibility)
+get_latlon_from_zip <- function(zipcode) {
+  # Using a more reliable geocoding service with detailed address info
+  url <- paste0("https://nominatim.openstreetmap.org/search")
+  
+  res <- GET(url, query = list(
+    q = paste(zipcode, "USA"),
+    format = "json",
+    countrycodes = "us",
+    limit = 1,
+    addressdetails = 1
+  ))
+  
+  if (status_code(res) != 200) {
+    stop("❌ Invalid ZIP code or failed to connect to geocoding API.")
+  }
+  
+  data <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  
+  if (length(data) == 0) {
+    stop(paste("❌ No location found for ZIP code:", zipcode))
+  }
+  
+  lat <- as.numeric(data[1, "lat"])
+  lon <- as.numeric(data[1, "lon"])
+  
+  # Extract city and state information
+  address <- data[1, "address"]
+  city <- ""
+  state <- ""
+  
+  if (!is.null(address)) {
+    # Try different address components for city name
+    city_options <- c("city", "town", "village", "hamlet", "suburb", "neighbourhood")
+    for (option in city_options) {
+      if (!is.null(address[[option]]) && address[[option]] != "") {
+        city <- address[[option]]
+        break
+      }
+    }
+    
+    # Get state
+    if (!is.null(address$state)) {
+      state <- address$state
+    }
+  }
+  
+  # If no city found in address, use display_name
+  if (city == "" && !is.null(data[1, "display_name"])) {
+    display_parts <- strsplit(data[1, "display_name"], ",")[[1]]
+    if (length(display_parts) >= 2) {
+      city <- trimws(display_parts[2])  # Usually the second part is city
+    }
+  }
+  
+  # Create location name
+  if (city != "" && state != "") {
+    location_name <- paste(city, state, sep = ", ")
+  } else if (city != "") {
+    location_name <- city
+  } else {
+    location_name <- paste("ZIP", zipcode)
+  }
+  
+  return(list(
+    lat = lat, 
+    lon = lon, 
+    city = city,
+    state = state,
+    location_name = location_name,
+    zipcode = zipcode
+  ))
+}
+
+# Your existing air quality function (keeping it as is)
+get_air_quality <- function(location) {
+  
+  # Handle both ZIP code and coordinates
+  if (is.character(location)) {
+    location_info <- get_latlon_from_zip(location)
+    coords <- c(lat = location_info$lat, lon = location_info$lon)
+    cat(sprintf("📍 ZIP %s -> %s (%.4f, %.4f)\n", 
+                location, location_info$location_name, coords["lat"], coords["lon"]))
+    location_name <- location_info$location_name
+  } else {
+    coords <- location # assume it's c(lat, lon)
+    cat(sprintf("📍 Using coordinates: %.4f, %.4f\n", coords["lat"], coords["lon"]))
+    location_name <- "Custom Coordinates"
+  }
+  
+  # Build Purple Air API URL with proper parameters
+  url <- paste0(
+    "https://api.purpleair.com/v1/sensors?",
+    "fields=sensor_index,name,latitude,longitude,pm2.5_atm,pm2.5_cf_1,pm10.0_atm,pm10.0_cf_1,temperature,humidity,pressure,last_seen,date_created&",
+    sprintf("nwlng=%.6f&", coords["lon"] - 0.05),  # Smaller search area for better results
+    sprintf("nwlat=%.6f&", coords["lat"] + 0.05),
+    sprintf("selng=%.6f&", coords["lon"] + 0.05),
+    sprintf("selat=%.6f&", coords["lat"] - 0.05),
+    "max_age=3600&",  # Data from last hour
+    "location_type=0"  # Outdoor sensors only
+  )
+  
+  # Make API request with proper headers
+  res <- GET(url, add_headers("X-API-Key" = api_key))
+  
+  if (status_code(res) != 200) {
+    cat(sprintf("❌ API Error: Status code %d\n", status_code(res)))
+    error_content <- content(res, "text")
+    cat(sprintf("Error details: %s\n", error_content))
+    stop("Failed to connect to PurpleAir API.")
+  }
+  
+  result <- fromJSON(content(res, "text", encoding = "UTF-8"))
+  
+  # Check if any sensors were found
+  if (is.null(result$data) || length(result$data) == 0) {
+    warning("⚠️ No sensors found near this location.")
+    return(list(pm25 = NA, pm10 = NA, temperature = NA, humidity = NA, sensor_count = 0))
+  }
+  
+  # Convert to dataframe
+  if (is.matrix(result$data)) {
+    df <- as.data.frame(result$data, stringsAsFactors = FALSE)
+  } else {
+    df <- as.data.frame(do.call(rbind, result$data), stringsAsFactors = FALSE)
+  }
+  
+  # Set column names
+  colnames(df) <- result$fields
+  
+  # Convert numeric columns
+  numeric_cols <- c("sensor_index", "latitude", "longitude", "pm2.5_atm", "pm2.5_cf_1", 
+                   "pm10.0_atm", "pm10.0_cf_1", "temperature", "humidity", "pressure", "last_seen")
+  
+  for (col in numeric_cols) {
+    if (col %in% colnames(df)) {
+      df[[col]] <- as.numeric(df[[col]])
+    }
+  }
+  
+  # Filter out invalid values (negative or extremely high readings)
+  df <- df[!is.na(df$pm2.5_atm) & df$pm2.5_atm >= 0 & df$pm2.5_atm < 1000, ]
+  
+  if (nrow(df) == 0) {
+    warning("⚠️ All sensors returned invalid values.")
+    return(list(pm25 = NA, pm10 = NA, temperature = NA, humidity = NA, sensor_count = 0))
+  }
+  
+  # Calculate average values from all valid sensors
+  avg_pm25 <- round(mean(df$pm2.5_atm, na.rm = TRUE), 1)
+  avg_pm10 <- round(mean(df$pm10.0_atm, na.rm = TRUE), 1)
+  avg_temp <- round(mean(df$temperature, na.rm = TRUE), 1)
+  avg_humidity <- round(mean(df$humidity, na.rm = TRUE), 1)
+  
+  # Also return the most recent sensor data
+  most_recent_idx <- which.max(df$last_seen)
+  best_sensor <- df[most_recent_idx, ]
+  
+  cat(sprintf("✅ Found %d valid sensors\n", nrow(df)))
+  cat(sprintf("📊 Average PM2.5: %.1f μg/m³\n", avg_pm25))
+  cat(sprintf("📊 Average PM10: %.1f μg/m³\n", avg_pm10))
+  cat(sprintf("🌡️ Average Temperature: %.1f°F\n", avg_temp))
+  cat(sprintf("💧 Average Humidity: %.1f%%\n", avg_humidity))
+  
+  return(list(
+    # Average values
+    pm25_avg = avg_pm25,
+    pm10_avg = avg_pm10,
+    temperature_avg = avg_temp,
+    humidity_avg = avg_humidity,
+    
+    # Most recent sensor values
+    pm25_recent = round(best_sensor$pm2.5_atm, 1),
+    pm10_recent = round(best_sensor$pm10.0_atm, 1),
+    temperature_recent = round(best_sensor$temperature, 1),
+    humidity_recent = round(best_sensor$humidity, 1),
+    
+    # Metadata
+    sensor_count = nrow(df),
+    coordinates = coords,
+    location_name = if(exists("location_name")) location_name else "Unknown",
+    sensors_data = df,
+    most_recent_sensor = best_sensor
+  ))
+}
+
+# Enhanced Healthcare AI Agent with Address Support
+EnhancedHealthcareAIAgent <- R6Class("EnhancedHealthcareAIAgent",
+  inherit = HealthcareAIAgent,
+  public = list(
+    
+    # New method: Analyze health impact by address
+    analyze_health_impact_by_address = function(address, user_profile = NULL, specific_question = NULL, 
+                                               radius_miles = 5, use_google_geocoding = TRUE) {
+      cat(sprintf("🏥 Generating health analysis for address: %s\n", address))
+      cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+      
+      # Step 1: Geocode the address
+      geocode_result <- geocode_address(address, use_google_geocoding)
+      if (is.null(geocode_result)) {
+        cat("🔄 Switching to fallback health analysis due to geocoding failure...\n")
+        return(self$generate_fallback_health_advice_address(address, user_profile, specific_question))
+      }
+      
+      # Step 2: Get air quality data by coordinates
+      air_data <- get_air_quality_by_coordinates(
+        geocode_result$latitude, 
+        geocode_result$longitude, 
+        radius_miles
+      )
+      
+      if (is.null(air_data) || is.na(air_data$pm25_avg)) {
+        cat("🔄 Switching to fallback health analysis...\n")
+        return(self$generate_fallback_health_advice_address(address, user_profile, specific_question))
+      }
+      
+      # Add location information to air_data
+      air_data$location_name <- geocode_result$formatted_address
+      air_data$search_address <- address
+      
+      # Step 3: Generate health analysis
+      health_context <- self$prepare_health_context_address(air_data, geocode_result, user_profile)
+      health_analysis <- self$generate_health_recommendations(health_context, specific_question)
+      final_report <- self$format_health_report_address(air_data, geocode_result, health_analysis, user_profile)
+      
+      list(
+        health_report = final_report,
+        raw_analysis = health_analysis,
+        air_quality_data = air_data,
+        geocoding_result = geocode_result,
+        generated_at = Sys.time(),
+        user_profile = user_profile,
+        agent_info = list(name = self$agent_name, model = self$model, provider = "Anthropic")
+      )
+    },
+    
+    # Enhanced context preparation for address-based queries
+    prepare_health_context_address = function(air_data, geocode_result, user_profile) {
+      context <- sprintf(
+        "=== REAL-TIME AIR QUALITY HEALTH ASSESSMENT (ADDRESS-BASED) ===
+Search Address: %s
+Geocoded Location: %s
+Coordinates: %.6f°N, %.6f°W
+Data Collection Time: %s
+Search Radius: %.1f miles
+Monitoring Network: %d active PurpleAir sensors
+Closest Sensor Distance: %.2f miles
+
+=== CURRENT POLLUTION LEVELS ===
+PM2.5 Concentration: %.1f μg/m³
+Air Quality Index (AQI): %d
+AQI Category: %s
+PM10 Concentration: %.1f μg/m³
+
+=== ENVIRONMENTAL CONDITIONS ===
+Temperature: %.1f°F (%.1f°C)
+Relative Humidity: %.1f%%
+
+=== HEALTH STANDARDS COMPARISON ===
+WHO PM2.5 Daily Guideline: 15 μg/m³ (Current: %.1fx guideline)
+EPA PM2.5 24-hour Standard: 35 μg/m³ (Current: %.1fx standard)",
+        air_data$search_address %||% "Not specified",
+        geocode_result$formatted_address %||% "Unknown Location", 
+        geocode_result$latitude %||% 0,
+        geocode_result$longitude %||% 0,
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        air_data$search_radius_miles %||% 5,
+        air_data$sensor_count %||% 0,
+        air_data$closest_sensor_distance %||% 0,
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0,
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        round((air_data$pm25_avg %||% 0)/15, 2),
+        round((air_data$pm25_avg %||% 0)/35, 2)
+      )
+      
+      if (!is.null(user_profile)) {
+        profile_text <- sprintf(
+          "\n\n=== USER HEALTH PROFILE ===
+Age Group: %s
+Health Conditions: %s
+Respiratory Sensitivities: %s
+Activity Level: %s
+Special Considerations: %s",
+          user_profile$age_group %||% "Not specified",
+          user_profile$health_conditions %||% "Not specified", 
+          user_profile$sensitivities %||% "None reported",
+          user_profile$activity_level %||% "Normal",
+          user_profile$special_notes %||% "None"
+        )
+        context <- paste0(context, profile_text)
+      }
+      context
+    },
+    
+    # Enhanced report formatting for address-based queries
+    format_health_report_address = function(air_data, geocode_result, health_analysis, user_profile) {
+      sprintf(
+        "🏥 ENHANCED HEALTHCARE AI AGENT - ADDRESS-BASED HEALTH ANALYSIS
+════════════════════════════════════════════════════════════════════════════════
+🔍 Search Address: %s
+📍 Geocoded Location: %s
+📍 Coordinates: %.6f°N, %.6f°W
+📅 Report Generated: %s
+🤖 AI Health Advisor: %s
+👤 User Profile: %s
+
+🌡️ CURRENT ENVIRONMENTAL CONDITIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• PM2.5 Concentration: %.1f μg/m³
+• Air Quality Index: %d (%s)
+• PM10 Concentration: %.1f μg/m³
+• Temperature: %.1f°F (%.1f°C) / Humidity: %.1f%%
+• Data Sources: %d PurpleAir sensors within %.1f miles
+• Closest Sensor: %.2f miles away
+
+🩺 DR. CLAUDE'S MEDICAL ASSESSMENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+📊 HEALTH RISK INDICATOR: %s
+
+⚠️ DISCLAIMER: This analysis is for informational purposes only and should not replace professional medical advice.",
+        air_data$search_address %||% "Not specified",
+        geocode_result$formatted_address %||% "Unknown Location",
+        geocode_result$latitude %||% 0,
+        geocode_result$longitude %||% 0,
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
+        self$agent_name,
+        ifelse(is.null(user_profile), "General Population",
+               sprintf("%s | %s",
+                       user_profile$age_group %||% "Age not specified",
+                       user_profile$health_conditions %||% "Health status not specified")),
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0, 
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        air_data$sensor_count %||% 0,
+        air_data$search_radius_miles %||% 5,
+        air_data$closest_sensor_distance %||% 0,
+        health_analysis,
+        self$get_health_risk_indicator(air_data$aqi %||% 0, air_data$aqi_category %||% "Unknown")
+      )
+    },
+    
+    # Fallback advice for address-based queries
+    generate_fallback_health_advice_address = function(address, user_profile = NULL, specific_question = NULL) {
+      fallback_context <- sprintf(
+        "=== GENERAL HEALTH CONSULTATION (ADDRESS-BASED) ===
+Search Address: %s
+Data Status: Real-time air quality data temporarily unavailable
+Consultation Time: %s
+
+Due to data unavailability, please provide general air quality health guidance including:
+1. Typical air quality concerns for this type of location
+2. General protective measures for residents
+3. When to check air quality before outdoor activities  
+4. Resources for real-time air quality monitoring",
+        address, format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      )
+      
+      if (!is.null(user_profile)) {
+        fallback_context <- paste0(fallback_context, sprintf(
+          "\n\nUser Profile: %s with %s",
+          user_profile$age_group %||% "General population",
+          user_profile$health_conditions %||% "no specified health conditions"
+        ))
+      }
+      
+      if (!is.null(specific_question)) {
+        fallback_context <- paste0(fallback_context, sprintf("\n\nSpecific Question: %s", specific_question))
+      }
+      
+      fallback_advice <- self$call_claude_api(
+        "You are Dr. Claude providing general air quality health guidance when real-time data is unavailable for an address-based query.",
+        fallback_context
+      )
+      
+      sprintf(
+        "🏥 ENHANCED HEALTHCARE AI AGENT - GENERAL HEALTH GUIDANCE
+════════════════════════════════════════════════════════════════════════════════
+🔍 Search Address: %s
+📅 Consultation Time: %s
+🤖 AI Health Advisor: %s
+⚠️ Data Status: Real-time air quality data temporarily unavailable
+
+🩺 DR. CLAUDE'S GENERAL HEALTH GUIDANCE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+💡 NEXT STEPS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Check your PurpleAir API key setup
+2. Verify geocoding service availability  
+3. Try again in a few minutes
+4. Use EPA AirNow for current conditions
+
+⚠️ DISCLAIMER: This is general guidance only.",
+        address, format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), self$agent_name, fallback_advice
+      )
+    }
+  )
+)
+
+# ============================== Enhanced Convenience Functions ==============================
+
+# Get health recommendations by address
+get_health_recommendations_by_address <- function(address, user_profile = NULL, question = NULL, 
+                                                 radius_miles = 5, use_google = TRUE) {
+  enhanced_agent <- EnhancedHealthcareAIAgent$new()
+  result <- enhanced_agent$analyze_health_impact_by_address(address, user_profile, question, 
+                                                           radius_miles, use_google)
+  if (is.character(result)) { 
+    cat(result) 
+    return(result) 
+  }
+  cat(result$health_report)
+  result
+}
+
+# Health consultation by address
+health_consultation_by_address <- function(address, question, radius_miles = 5) {
+  cat("═══════════════════════════════════════════════════════════════════════════════\n")
+  cat(sprintf("🩺 HEALTH CONSULTATION for Address: %s\n", address))
+  cat(sprintf("❓ Question: %s\n", question))
+  cat(sprintf("📍 Search Radius: %.1f miles\n", radius_miles))
+  cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+  
+  get_health_recommendations_by_address(address, NULL, question, radius_miles)
+}
+
+# Quick health check by address
+quick_health_check_by_address <- function(address, question = NULL, radius_miles = 5) {
+  if (is.null(question)) {
+    question <- "What is the current health risk level and what activities are safe today?"
+  }
+  
+  enhanced_agent <- EnhancedHealthcareAIAgent$new()
+  result <- enhanced_agent$analyze_health_impact_by_address(address, NULL, question, radius_miles)
+  
+  if (!is.character(result)) {
+    cat(result$health_report)
+  } else {
+    cat(result)
+  }
+  
+  result
+}
+
+# Test geocoding function
+test_geocoding <- function(address = "1600 Pennsylvania Avenue NW, Washington, DC") {
+  cat("🧪 Testing geocoding functionality...\n")
+  cat(sprintf("📍 Test address: %s\n", address))
+  cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+  
+  # Test with OpenStreetMap
+  cat("\n1. Testing OpenStreetMap Nominatim:\n")
+  result_osm <- geocode_address_nominatim(address)
+  
+  # Test with Google (if API key available)
+  google_key <- Sys.getenv("GOOGLE_MAPS_API_KEY")
+  if (!identical(google_key, "") && !is.na(google_key)) {
+    cat("\n2. Testing Google Maps API:\n")
+    result_google <- geocode_address_google(address)
+  } else {
+    cat("\n2. Google Maps API: ⚠️ API key not found (set GOOGLE_MAPS_API_KEY)\n")
+    result_google <- NULL
+  }
+  
+  list(osm = result_osm, google = result_google)
+}
+
+# Enhanced demo function
+run_enhanced_healthcare_demo <- function(demo_address = "1600 Pennsylvania Avenue NW, Washington, DC") {
+  cat("🎯 ENHANCED HEALTHCARE AI AGENT DEMO (ADDRESS-BASED)\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+  
+  if (!check_healthcare_setup()) {
+    cat("⚠️ Please complete setup first!\n")
+    return()
+  }
+  
+  cat("Demo 1: Geocoding Test\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  geocoding_results <- test_geocoding(demo_address)
+  
+  cat("\n\nDemo 2: Basic Health Analysis by Address\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  result <- get_health_recommendations_by_address(demo_address)
+  
+  cat("\n\nDemo 3: Health Consultation by Address\n") 
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  consultation <- health_consultation_by_address(
+    demo_address, 
+    "Is it safe for elderly people to take walks in this area today?"
+  )
+  
+  list(geocoding = geocoding_results, basic = result, consultation = consultation)
+}
+```
+
+```{r}
+# Enhanced setup check
+ccheck_enhanced_setup <- function() {
+  cat("🔧 ENHANCED HEALTHCARE AI AGENT SETUP CHECK\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n")
+
+  issues <- character(0)
+
+  # 1) 基础检查
+  if (!check_healthcare_setup()) {
+    issues <- c(issues, "Base healthcare setup incomplete")
+  }
+
+  # 2) PurpleAir API key
+  purple_key <- Sys.getenv("PURPLEAIR_API_KEY")
+  if (identical(purple_key, "") || is.na(purple_key)) {
+    issues <- c(issues, "PURPLEAIR_API_KEY not found")
+    cat("⚠️ PurpleAir API key not found\n")
+    cat("💡 Get your free API key at: https://develop.purpleair.com/\n")
+  } else {
+    cat("✅ PurpleAir API key loaded\n")
+  }
+
+  # 3) Google Maps
+  google_key <- Sys.getenv("GOOGLE_MAPS_API_KEY")
+  if (identical(google_key, "") || is.na(google_key)) {
+    cat("ℹ️ Google Maps API key not found (will use free OpenStreetMap)\n")
+    cat("💡 For better geocoding: https://developers.google.com/maps\n")
+  } else {
+    cat("✅ Google Maps API key loaded (enhanced geocoding available)\n")
+  }
+
+  # 4) 简单联网测试
+  cat("🌐 Testing internet connectivity...\n")
+  ok <- tryCatch({
+    httr::status_code(httr::GET("https://httpbin.org/status/200", httr::timeout(10))) == 200
+  }, error = function(e) FALSE)
+
+  if (ok) {
+    cat("✅ Internet connectivity OK\n")
+  } else {
+    cat("❌ Internet connectivity issues detected\n")
+    issues <- c(issues, "Internet connectivity problems")
+  }
+
+  # 5) 汇总
+  if (length(issues) > 0) {
+    cat("\n🔧 SETUP ISSUES:\n")
+    cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    for (issue in issues) cat(paste0("❌ ", issue, "\n"))
+    cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    return(FALSE)
+  }
+
+  cat("✅ Enhanced setup looks good!\n")
+  return(TRUE)
+}
+
+```
+
+```{r}
+get_latlon_from_address("700 W 9th St,Los Angeles,CA")
+```
+
+```{r}
+result <- get_air_quality_with_aqi_by_address("700 W 9th St,Los Angeles,CA")
+```
+
+# Part 2 # Buile AI agent LLM
+
+```{r}
+# ==== env ====
+readRenviron(".Renviron")
+claude_api_key <- Sys.getenv("ANTHROPIC_API_KEY")
+
+# allow override by env var
+DEFAULT_CLAUDE_MODEL <- Sys.getenv("CLAUDE_MODEL", unset = "claude-3-7-sonnet-20250219")
+VALID_CLAUDE_MODELS <- c(
+  "claude-opus-4-1-20250805",
+  "claude-sonnet-4-20250514",
+  "claude-3-7-sonnet-20250219",
+  "claude-3-5-haiku-20241022"
+)
+
+validate_model <- function(model) {
+  if (!model %in% VALID_CLAUDE_MODELS) {
+    warning(sprintf("Model '%s' not in known list; falling back to '%s'.",
+                    model, "claude-3-7-sonnet-20250219"))
+    return("claude-3-7-sonnet-20250219")
+  }
+  model
+}
+
+# NULL 合并
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || (length(x) == 1 && is.na(x))) y else x
+
+# ---- robust text extractor for Anthropic responses ----
+.extract_claude_text <- function(result) {
+  if (is.null(result$content)) return(NULL)
+  content <- result$content
+
+  # list (official schema)
+  if (is.list(content)) {
+    parts <- lapply(content, function(p) {
+      if (is.list(p) && !is.null(p$text)) return(p$text)
+      if (is.character(p)) return(paste(p, collapse = "\n"))
+      NULL
+    })
+    parts <- Filter(Negate(is.null), parts)
+    if (length(parts) > 0) return(paste(unlist(parts), collapse = "\n"))
+  }
+
+  # data.frame (simplified)
+  if (is.data.frame(content) && "text" %in% names(content)) {
+    txt <- paste0(content$text, collapse = "\n")
+    return(if (nzchar(txt)) txt else NULL)
+  }
+
+  # character
+  if (is.character(content)) return(paste(content, collapse = "\n"))
+
+  NULL
+}
+
+# ============================== Setup checks ==============================
+check_healthcare_setup <- function() {
+  issues <- c()
+
+  # API key presence
+  claude_key <- Sys.getenv("ANTHROPIC_API_KEY")
+  if (identical(claude_key, "") || is.na(claude_key)) {
+    issues <- c(issues, "ANTHROPIC_API_KEY not found")
+  } else {
+    cat("✅ Anthropic API key loaded\n")
+  }
+
+  # required functions from Module 1
+  required_functions <- c("get_air_quality_with_aqi", "get_latlon_from_zip", "calculate_aqi_pm25")
+  missing_functions <- required_functions[!vapply(required_functions, exists, logical(1))]
+  if (length(missing_functions) > 0) {
+    issues <- c(issues, paste("Missing functions from first module:", paste(missing_functions, collapse = ", ")))
+    cat("⚠️ Missing functions from air quality module:", paste(missing_functions, collapse = ", "), "\n")
+    cat("💡 Please source/run your first air quality module before this.\n")
+  } else {
+    cat("✅ Air quality functions available\n")
+  }
+
+  if (length(issues) > 0) {
+    cat("\n🔧 SETUP ISSUES:\n")
+    cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    for (issue in issues) cat(paste("❌", issue, "\n"))
+    cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    return(FALSE)
+  }
+  TRUE
+}
+
+# ============================== Low-cost connectivity test ==============================
+test_claude_connection <- function() {
+  cat("🧪 Testing Claude API connection...\n")
+
+  api_key <- Sys.getenv("ANTHROPIC_API_KEY")
+  if (identical(api_key, "")) {
+    cat("❌ API key not set\n")
+    return(FALSE)
+  }
+
+  url <- "https://api.anthropic.com/v1/messages"
+  test_model <- Sys.getenv("CLAUDE_MODEL", unset = "claude-3-5-haiku-20241022")  # cheap test model
+  body <- list(
+    model = test_model,
+    max_tokens = 1,                               # minimize cost
+    system = "Reply exactly: pong",
+    messages = list(list(role = "user", content = "ping"))
+  )
+
+  resp <- tryCatch({
+    POST(
+      url,
+      add_headers(
+        "x-api-key" = api_key,
+        "Content-Type" = "application/json",
+        "anthropic-version" = "2023-06-01"
+      ),
+      body = body, encode = "json", timeout(20)
+    )
+  }, error = function(e) {
+    cat(sprintf("❌ Connection error: %s\n", e$message))
+    return(NULL)
+  })
+
+  if (is.null(resp)) return(FALSE)
+
+  sc <- status_code(resp)
+  raw <- content(resp, "text", encoding = "UTF-8")
+  cat(sprintf("📡 HTTP status code: %d\n", sc))
+
+  if (sc != 200) {
+    err <- tryCatch(fromJSON(raw, simplifyVector = FALSE), error = function(e) NULL)
+    if (sc == 404 && !is.null(err$error$message) && grepl("model:", err$error$message, fixed = TRUE)) {
+      cat(sprintf("❌ Model '%s' not found (404). Set CLAUDE_MODEL to a current model.\n", test_model))
+    } else if (sc == 401) {
+      cat("❌ Unauthorized (401). Please check ANTHROPIC_API_KEY.\n")
+    } else {
+      cat(sprintf("❌ API call failed: %s\n", raw))
+    }
+    return(FALSE)
+  }
+
+  res <- fromJSON(raw, simplifyVector = FALSE)
+  txt <- .extract_claude_text(res)
+  if (!is.null(txt) && grepl("^pong$", txt)) {
+    cat("✅ Claude API connection successful (pong)\n")
+  } else {
+    cat("⚠️ Received unexpected content; connectivity is OK but response format differed.\n")
+  }
+  if (!is.null(res$usage)) {
+    cat(sprintf("📊 usage: in=%s, out=%s tokens\n",
+        res$usage$input_tokens %||% 0, res$usage$output_tokens %||% 0))
+  }
+  TRUE
+}
+
+# ===============================================================================
+# Healthcare AI Agent R6 Class
+# ===============================================================================
+HealthcareAIAgent <- R6Class("HealthcareAIAgent",
+  public = list(
+    api_key = NULL,
+    base_url = NULL,
+    model = NULL,
+    agent_name = "Dr. Claude",
+
+    initialize = function(api_key = Sys.getenv("ANTHROPIC_API_KEY"),
+                          base_url = "https://api.anthropic.com/v1",
+                          model = DEFAULT_CLAUDE_MODEL) {
+
+      if (!check_healthcare_setup()) stop("❌ Healthcare AI Agent setup incomplete")
+
+      # low-cost connectivity test once
+      if (!test_claude_connection()) stop("❌ Claude API connection failed - please check your API key / model")
+
+      self$api_key <- api_key
+      self$base_url <- base_url
+      self$model <- validate_model(model)
+
+      cat("✅ Healthcare AI Agent initialized successfully\n")
+      cat(sprintf("🤖 Using model: %s\n", self$model))
+      cat(sprintf("👨‍⚕️ Agent name: %s\n\n", self$agent_name))
+    },
+
+    analyze_health_impact = function(zipcode, user_profile = NULL, specific_question = NULL) {
+      cat(sprintf("🏥 Generating health analysis for ZIP code: %s\n", zipcode))
+      cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+      air_data <- self$get_air_quality_data(zipcode)
+      if (is.null(air_data) || is.na(air_data$pm25_avg)) {
+        cat("🔄 Switching to fallback health analysis...\n")
+        return(self$generate_fallback_health_advice(zipcode, user_profile, specific_question))
+      }
+
+      health_context <- self$prepare_health_context(air_data, user_profile)
+      health_analysis <- self$generate_health_recommendations(health_context, specific_question)
+      final_report <- self$format_health_report(air_data, health_analysis, user_profile)
+
+      list(
+        health_report = final_report,
+        raw_analysis = health_analysis,
+        air_quality_data = air_data,
+        generated_at = Sys.time(),
+        user_profile = user_profile,
+        agent_info = list(name = self$agent_name, model = self$model, provider = "Anthropic")
+      )
+    },
+
+    get_air_quality_data = function(zipcode) {
+      cat("📊 Fetching real-time air quality data...\n")
+      tryCatch({
+        air_data <- get_air_quality_with_aqi(zipcode)
+        if (is.null(air_data) || is.na(air_data$pm25_avg)) {
+          cat("⚠️ No valid air quality data returned\n"); return(NULL)
+        }
+        cat("✅ Air quality data retrieved successfully\n"); air_data
+      }, error = function(e) {
+        cat(sprintf("❌ Air Quality API Error: %s\n", e$message)); NULL
+      })
+    },
+
+    call_claude_api = function(system_prompt, user_prompt, max_retries = 3) {
+      url <- paste0(self$base_url, "/messages")
+      body <- list(
+        model = self$model,
+        max_tokens = 2000,
+        temperature = 0.1,
+        system = system_prompt,
+        messages = list(list(role = "user", content = user_prompt))
+      )
+
+      for (attempt in 1:max_retries) {
+        cat(sprintf("🤖 Consulting with Dr. Claude (attempt %d)...\n", attempt))
+        ok <- tryCatch({
+          response <- POST(
+            url,
+            add_headers(
+              "x-api-key" = self$api_key,
+              "Content-Type" = "application/json",
+              "anthropic-version" = "2023-06-01"
+            ),
+            body = body, encode = "json", timeout(60)
+          )
+
+          sc <- status_code(response)
+          raw <- content(response, "text", encoding = "UTF-8")
+          cat(sprintf("📡 HTTP status code: %d\n", sc))
+
+          if (sc != 200) {
+            err <- tryCatch(fromJSON(raw, simplifyVector = FALSE), error = function(e) NULL)
+            if (sc == 404 && !is.null(err$error$message) && grepl("model:", err$error$message, fixed = TRUE)) {
+              stop(sprintf("Model '%s' not found (HTTP 404). Switch to a current model (e.g., 'claude-3-7-sonnet-20250219').", self$model))
+            }
+            if (sc == 401) stop("Unauthorized (HTTP 401). Check ANTHROPIC_API_KEY.")
+            if (sc == 429) { cat("⚠️ Rate limited, retrying...\n"); Sys.sleep(2^attempt); return(FALSE) }
+            stop(sprintf("Claude API error (HTTP %d): %s", sc, raw))
+          }
+
+          res <- fromJSON(raw, simplifyVector = FALSE)
+          txt <- .extract_claude_text(res)
+          if (is.null(txt) || !nzchar(txt)) txt <- "Claude API returned unexpected response format"
+          cat("✅ Health analysis completed\n")
+          assign(".last_claude_usage", res$usage, envir = .GlobalEnv)
+          assign(".last_claude_request", res$id %||% NA, envir = .GlobalEnv)
+          return(txt)
+        }, error = function(e) {
+          cat(sprintf("❌ Request error (attempt %d): %s\n", attempt, e$message))
+          return(FALSE)
+        })
+
+        if (is.character(ok)) return(ok)
+      }
+      "Unable to generate health analysis due to repeated API errors."
+    },
+
+    prepare_health_context = function(air_data, user_profile) {
+      context <- sprintf(
+        "=== REAL-TIME AIR QUALITY HEALTH ASSESSMENT ===
+Location: %s
+ZIP Code: %s
+Coordinates: %.6f°N, %.6f°W
+Data Collection Time: %s
+Monitoring Network: %d active sensors
+
+=== CURRENT POLLUTION LEVELS ===
+PM2.5 Concentration: %.1f μg/m³
+Air Quality Index (AQI): %d
+AQI Category: %s
+PM10 Concentration: %.1f μg/m³
+
+=== ENVIRONMENTAL CONDITIONS ===
+Temperature: %.1f°F (%.1f°C)
+Relative Humidity: %.1f%%
+
+=== HEALTH STANDARDS COMPARISON ===
+WHO PM2.5 Daily Guideline: 15 μg/m³ (Current: %.1fx guideline)
+EPA PM2.5 24-hour Standard: 35 μg/m³ (Current: %.1fx standard)",
+        air_data$location_name %||% "Unknown Location",
+        air_data$zipcode %||% "Not specified",
+        air_data$coordinates["lat"] %||% 0,
+        air_data$coordinates["lon"] %||% 0,
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        air_data$sensor_count %||% 0,
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0,
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        round((air_data$pm25_avg %||% 0)/15, 2),
+        round((air_data$pm25_avg %||% 0)/35, 2)
+      )
+
+      if (!is.null(user_profile)) {
+        profile_text <- sprintf(
+          "\n\n=== USER HEALTH PROFILE ===
+Age Group: %s
+Health Conditions: %s
+Respiratory Sensitivities: %s
+Activity Level: %s
+Special Considerations: %s",
+          user_profile$age_group %||% "Not specified",
+          user_profile$health_conditions %||% "Not specified",
+          user_profile$sensitivities %||% "None reported",
+          user_profile$activity_level %||% "Normal",
+          user_profile$special_notes %||% "None"
+        )
+        context <- paste0(context, profile_text)
+      }
+      context
+    },
+
+    generate_health_recommendations = function(context, specific_question = NULL) {
+      system_prompt <- "You are Dr. Claude, a board-certified environmental health physician specializing in air pollution health impacts. Provide evidence-based, actionable health guidance based on real-time air quality data. Your recommendations should be medically sound, personalized when possible, and include specific protective measures."
+      user_prompt <-
+        if (is.null(specific_question)) paste(
+          context,
+          "\n=== COMPREHENSIVE HEALTH ANALYSIS REQUEST ===",
+          "Please provide a thorough health impact analysis including:",
+          "1. Immediate health risk assessment for general and vulnerable populations",
+          "2. Specific activity recommendations with timeframes",
+          "3. Protective measures (masks, indoor air quality, etc.)",
+          "4. Symptoms to monitor and when to seek medical attention",
+          "5. Best timing for outdoor activities today"
+        ) else paste(
+          context,
+          "\n=== SPECIFIC MEDICAL INQUIRY ===",
+          "User Question:", specific_question,
+          "\nProvide comprehensive medical guidance addressing this specific concern while considering current air quality conditions."
+        )
+
+      self$call_claude_api(system_prompt, user_prompt)
+    },
+
+    generate_fallback_health_advice = function(zipcode, user_profile = NULL, specific_question = NULL) {
+      fallback_context <- sprintf(
+        "=== GENERAL HEALTH CONSULTATION ===
+Location: ZIP Code %s area
+Data Status: Real-time air quality data temporarily unavailable
+Consultation Time: %s
+
+Due to data unavailability, please provide general air quality health guidance including:
+1. Typical air quality concerns for urban areas
+2. General protective measures for residents
+3. When to check air quality before outdoor activities
+4. Resources for real-time air quality monitoring",
+        zipcode, format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      )
+      if (!is.null(user_profile)) {
+        fallback_context <- paste0(fallback_context, sprintf(
+          "\n\nUser Profile: %s with %s",
+          user_profile$age_group %||% "General population",
+          user_profile$health_conditions %||% "no specified health conditions"
+        ))
+      }
+      if (!is.null(specific_question)) {
+        fallback_context <- paste0(fallback_context, sprintf("\n\nSpecific Question: %s", specific_question))
+      }
+
+      fallback_advice <- self$call_claude_api(
+        "You are Dr. Claude providing general air quality health guidance when real-time data is unavailable.",
+        fallback_context
+      )
+
+      sprintf(
+        "🏥 HEALTHCARE AI AGENT - GENERAL HEALTH GUIDANCE
+════════════════════════════════════════════════════════════════════════════════
+📍 Location: ZIP Code %s
+📅 Consultation Time: %s
+🤖 AI Health Advisor: %s
+⚠️ Data Status: Real-time air quality data temporarily unavailable
+
+🩺 DR. CLAUDE'S GENERAL HEALTH GUIDANCE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+💡 NEXT STEPS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Check your first air quality module setup
+2. Verify PurpleAir API key
+3. Try again in a few minutes
+4. Use EPA AirNow for current conditions
+
+⚠️ DISCLAIMER: This is general guidance only.",
+        zipcode, format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), self$agent_name, fallback_advice
+      )
+    },
+
+    format_health_report = function(air_data, health_analysis, user_profile) {
+      sprintf(
+        "🏥 HEALTHCARE AI AGENT - HEALTH IMPACT ANALYSIS
+════════════════════════════════════════════════════════════════════════════════
+📍 Analysis Location: %s (%s)
+📅 Report Generated: %s
+🤖 AI Health Advisor: %s
+👤 User Profile: %s
+
+🌡️ CURRENT ENVIRONMENTAL CONDITIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• PM2.5 Concentration: %.1f μg/m³
+• Air Quality Index: %d (%s)
+• PM10 Concentration: %.1f μg/m³
+• Temperature: %.1f°F (%.1f°C) / Humidity: %.1f%%
+• Data Sources: %d active sensors
+
+🩺 DR. CLAUDE'S MEDICAL ASSESSMENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+📊 HEALTH RISK INDICATOR: %s
+
+⚠️ DISCLAIMER: This analysis is for informational purposes only and should not replace professional medical advice.",
+        air_data$location_name %||% "Unknown Location",
+        air_data$zipcode %||% "Not specified",
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
+        self$agent_name,
+        ifelse(is.null(user_profile), "General Population",
+               sprintf("%s | %s",
+                       user_profile$age_group %||% "Age not specified",
+                       user_profile$health_conditions %||% "Health status not specified")),
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0,
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        air_data$sensor_count %||% 0,
+        health_analysis,
+        self$get_health_risk_indicator(air_data$aqi %||% 0, air_data$aqi_category %||% "Unknown")
+      )
+    },
+
+    get_health_risk_indicator = function(aqi, category) {
+      risk_info <- switch(category,
+        "Good" = "🟢 MINIMAL RISK - Excellent conditions for all populations",
+        "Moderate" = "🟡 LOW RISK - Generally safe for most people",
+        "Unhealthy for Sensitive Groups" = "🟠 MODERATE RISK - Sensitive groups should limit exposure",
+        "Unhealthy" = "🔴 HIGH RISK - Everyone should reduce outdoor activities",
+        "Very Unhealthy" = "🟣 VERY HIGH RISK - Avoid outdoor activities",
+        "Hazardous" = "🟤 EMERGENCY LEVEL - Stay indoors",
+        "default" = "⚪ UNKNOWN RISK - Monitor conditions carefully"
+      )
+      risk_info
+    }
+  )
+)
+
+# ============================== Convenience ==============================
+get_health_recommendations <- function(zipcode, user_profile = NULL, question = NULL) {
+  health_agent <- HealthcareAIAgent$new()
+  result <- health_agent$analyze_health_impact(zipcode, user_profile, question)
+  if (is.character(result)) { cat(result); return(result) }
+  cat(result$health_report); result
+}
+
+health_consultation <- function(zipcode, question) {
+  cat("═══════════════════════════════════════════════════════════════════════════════\n")
+  cat(sprintf("🩺 HEALTH CONSULTATION for ZIP %s\n", zipcode))
+  cat(sprintf("❓ Question: %s\n", question))
+  cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+  get_health_recommendations(zipcode, NULL, question)
+}
+
+create_user_profile <- function(age_group = NULL, health_conditions = NULL,
+                                sensitivities = NULL, activity_level = NULL, special_notes = NULL) {
+  list(
+    age_group = age_group, health_conditions = health_conditions,
+    sensitivities = sensitivities, activity_level = activity_level,
+    special_notes = special_notes, created_at = Sys.time()
+  )
+}
+
+quick_health_check <- function(zipcode, question = NULL) {
+  if (is.null(question)) question <- "What is the current health risk level and what activities are safe today?"
+  health_agent <- HealthcareAIAgent$new()
+  result <- health_agent$analyze_health_impact(zipcode, NULL, question)
+  if (!is.character(result)) cat(result$health_report) else cat(result)
+  result
+}
+
+run_healthcare_demo <- function(demo_zipcode = "90210") {
+  cat("🎯 HEALTHCARE AI AGENT DEMO\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+  if (!check_healthcare_setup()) { cat("⚠️ Please complete setup first!\n"); return() }
+  cat("Demo: Basic Health Analysis\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  result <- get_health_recommendations(demo_zipcode)
+  cat("\n\nDemo: Health Consultation\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  consultation <- health_consultation(demo_zipcode, "Is it safe for my child with asthma to play outside?")
+  list(basic = result, consultation = consultation)
+}
+
+cat("\n🩺 Healthcare AI Agent Module Loaded Successfully!\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("📋 Available Functions:\n")
+cat("• get_health_recommendations('90210')\n")
+cat("• health_consultation('90210', 'Your question here')\n")
+cat("• quick_health_check('90210')\n")
+cat("• run_healthcare_demo()\n")
+cat("• check_healthcare_setup() - Check API configuration\n")
+cat("• test_claude_connection() - Test Claude API connection (cheap)\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("💡 Tip: Set CLAUDE_MODEL in .Renviron to switch models globally\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+```
+
+```{r}
+# Test setup
+check_healthcare_setup()
+
+# Test Claude connection
+test_claude_connection()
+
+```
+
+```{r}
+run_healthcare_demo("90015")
+```
+
+```{r}
+# 预置人群画像 -> 用户档案
+.profile_presets <- list(
+  general  = list(age_group="Adult",    health_conditions="None",             sensitivities="None",      activity_level="Normal"),
+  pregnant = list(age_group="Pregnant", health_conditions="Pregnancy",        sensitivities="Smell/PM2.5", activity_level="Light"),
+  elderly  = list(age_group="Elderly",  health_conditions="Age-related risks",sensitivities="PM2.5",     activity_level="Light"),
+  child    = list(age_group="Child",    health_conditions="None",             sensitivities="PM2.5",     activity_level="Moderate"),
+  asthma   = list(age_group="Adult",    health_conditions="Asthma",           sensitivities="PM2.5/Smoke",activity_level="Light"),
+  copd     = list(age_group="Adult",    health_conditions="COPD",             sensitivities="PM2.5/Smoke",activity_level="Light"),
+  athlete  = list(age_group="Adult",    health_conditions="None",             sensitivities="PM2.5",     activity_level="Vigorous")
+)
+
+# 缓存一个 Agent，避免反复初始化与联网测试
+.health_agent_cache <- NULL
+make_health_agent <- function(force_new = FALSE) {
+  if (!is.null(.health_agent_cache) && !force_new) return(.health_agent_cache)
+  agent <- HealthcareAIAgent$new(
+    api_key = Sys.getenv("ANTHROPIC_API_KEY"),
+    base_url = "https://api.anthropic.com/v1",
+    model = Sys.getenv("CLAUDE_MODEL", unset = "claude-3-7-sonnet-20250219")
+  )
+  .health_agent_cache <<- agent
+  agent
+}
+
+# 主函数：给 ZIP，返回健康报告；可选人群 preset、附加问题、另存为文件
+ai_health_report <- function(zipcode,
+                             profile_preset = c("general","pregnant","elderly","child","asthma","copd","athlete"),
+                             question = NULL,
+                             save_path = NULL,
+                             verbose = TRUE) {
+  profile_preset <- match.arg(profile_preset)
+
+  # 构建/合成用户档案
+  preset <- .profile_presets[[profile_preset]]
+  user_profile <- create_user_profile(
+    age_group        = preset$age_group,
+    health_conditions= preset$health_conditions,
+    sensitivities    = preset$sensitivities,
+    activity_level   = preset$activity_level,
+    special_notes    = sprintf("Preset: %s", profile_preset)
+  )
+
+  agent <- make_health_agent()
+
+  res <- agent$analyze_health_impact(zipcode, user_profile, question)
+
+  if (is.list(res) && !is.null(res$health_report)) {
+    if (verbose) {
+      cat("\n━━━━━━━━ HEALTH REPORT ━━━━━━━━\n")
+      cat(res$health_report, "\n")
+    }
+    if (!is.null(save_path)) {
+      writeLines(res$health_report, con = save_path, useBytes = TRUE)
+      if (verbose) cat(sprintf("💾 Saved to: %s\n", normalizePath(save_path)))
+    }
+    return(invisible(res))
+  } else {
+    cat(res, "\n")
+    return(invisible(res))
+  }
+}
+
+```
+
+# Testing
+
+```{r}
+ai_health_report("92620")
+```
+
+```{r}
+ai_health_report("92620", "asthma", question = "Can I walk in outside for 30mins？")
+```
+
+# This module bridges PurpleAir address/ZIP data with Claude health analysis
+
+```{r}
+
+if (!exists("get_air_quality_with_aqi_by_address")) {
+  stop("❌ Please run your PurpleAir address module first (Module 1)")
+}
+
+if (!exists("HealthcareAIAgent")) {
+  stop("❌ Please run your Claude healthcare module first (Module 2)")
+}
+
+# ============================== Enhanced Healthcare Agent ==============================
+
+EnhancedHealthcareAIAgent <- R6Class("EnhancedHealthcareAIAgent",
+  inherit = HealthcareAIAgent,
+  public = list(
+    
+    # New method: Analyze health impact by address
+    analyze_health_impact_by_address = function(address, user_profile = NULL, specific_question = NULL, 
+                                               search_radius_deg = 0.05) {
+      cat(sprintf("🏥 Generating health analysis for address: %s\n", address))
+      cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+      
+      # Step 1: Get air quality data by address using your existing function
+      air_data <- self$get_air_quality_data_by_address(address, search_radius_deg)
+      
+      if (is.null(air_data) || is.na(air_data$pm25_avg)) {
+        cat("🔄 Switching to fallback health analysis due to data unavailability...\n")
+        return(self$generate_fallback_health_advice_address(address, user_profile, specific_question))
+      }
+      
+      # Step 2: Generate health analysis using enhanced context
+      health_context <- self$prepare_health_context_address(air_data, user_profile)
+      health_analysis <- self$generate_health_recommendations(health_context, specific_question)
+      final_report <- self$format_health_report_address(air_data, health_analysis, user_profile)
+      
+      list(
+        health_report = final_report,
+        raw_analysis = health_analysis,
+        air_quality_data = air_data,
+        generated_at = Sys.time(),
+        user_profile = user_profile,
+        agent_info = list(name = self$agent_name, model = self$model, provider = "Anthropic")
+      )
+    },
+    
+    # Get air quality data by address (wrapper for your existing function)
+    get_air_quality_data_by_address = function(address, search_radius_deg = 0.05) {
+      cat("📊 Fetching real-time air quality data by address...\n")
+      tryCatch({
+        air_data <- get_air_quality_with_aqi_by_address(address, search_radius_deg)
+        
+        if (is.null(air_data) || is.na(air_data$pm25_avg)) {
+          cat("⚠️ No valid air quality data returned for address\n")
+          return(NULL)
+        }
+        
+        cat("✅ Address-based air quality data retrieved successfully\n")
+        return(air_data)
+        
+      }, error = function(e) {
+        cat(sprintf("❌ Address-based Air Quality API Error: %s\n", e$message))
+        return(NULL)
+      })
+    },
+    
+    # Enhanced context preparation for address-based queries
+    prepare_health_context_address = function(air_data, user_profile) {
+      context <- sprintf(
+        "=== REAL-TIME AIR QUALITY HEALTH ASSESSMENT (ADDRESS-BASED) ===
+Search Address: %s
+Geocoded Location: %s
+Coordinates: %.6f°N, %.6f°W
+Data Collection Time: %s
+Monitoring Network: %d active PurpleAir sensors
+
+=== CURRENT POLLUTION LEVELS ===
+PM2.5 Concentration: %.1f μg/m³
+Air Quality Index (AQI): %d
+AQI Category: %s
+PM10 Concentration: %.1f μg/m³
+
+=== ENVIRONMENTAL CONDITIONS ===
+Temperature: %.1f°F (%.1f°C)
+Relative Humidity: %.1f%%
+
+=== HEALTH STANDARDS COMPARISON ===
+WHO PM2.5 Daily Guideline: 15 μg/m³ (Current: %.1fx guideline)
+EPA PM2.5 24-hour Standard: 35 μg/m³ (Current: %.1fx standard)",
+        air_data$original_address %||% "Not specified",
+        air_data$location_name %||% "Unknown Location",
+        air_data$coordinates["lat"] %||% 0,
+        air_data$coordinates["lon"] %||% 0,
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        air_data$sensor_count %||% 0,
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0,
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        round((air_data$pm25_avg %||% 0)/15, 2),
+        round((air_data$pm25_avg %||% 0)/35, 2)
+      )
+      
+      if (!is.null(user_profile)) {
+        profile_text <- sprintf(
+          "\n\n=== USER HEALTH PROFILE ===
+Age Group: %s
+Health Conditions: %s
+Respiratory Sensitivities: %s
+Activity Level: %s
+Special Considerations: %s",
+          user_profile$age_group %||% "Not specified",
+          user_profile$health_conditions %||% "Not specified", 
+          user_profile$sensitivities %||% "None reported",
+          user_profile$activity_level %||% "Normal",
+          user_profile$special_notes %||% "None"
+        )
+        context <- paste0(context, profile_text)
+      }
+      return(context)
+    },
+    
+    # Enhanced report formatting for address-based queries
+    format_health_report_address = function(air_data, health_analysis, user_profile) {
+      sprintf(
+        "🏥 ENHANCED HEALTHCARE AI AGENT - ADDRESS-BASED HEALTH ANALYSIS
+════════════════════════════════════════════════════════════════════════════════
+🔍 Search Address: %s
+📍 Geocoded Location: %s
+📍 Coordinates: %.6f°N, %.6f°W
+📅 Report Generated: %s
+🤖 AI Health Advisor: %s
+👤 User Profile: %s
+
+🌡️ CURRENT ENVIRONMENTAL CONDITIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• PM2.5 Concentration: %.1f μg/m³
+• Air Quality Index: %d (%s)
+• PM10 Concentration: %.1f μg/m³
+• Temperature: %.1f°F (%.1f°C) / Humidity: %.1f%%
+• Data Sources: %d PurpleAir sensors
+
+🩺 DR. CLAUDE'S MEDICAL ASSESSMENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+📊 HEALTH RISK INDICATOR: %s
+
+⚠️ DISCLAIMER: This analysis is for informational purposes only and should not replace professional medical advice.",
+        air_data$original_address %||% "Not specified",
+        air_data$location_name %||% "Unknown Location",
+        air_data$coordinates["lat"] %||% 0,
+        air_data$coordinates["lon"] %||% 0,
+        format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"),
+        self$agent_name,
+        ifelse(is.null(user_profile), "General Population",
+               sprintf("%s | %s",
+                       user_profile$age_group %||% "Age not specified",
+                       user_profile$health_conditions %||% "Health status not specified")),
+        air_data$pm25_avg %||% 0,
+        air_data$aqi %||% 0, 
+        air_data$aqi_category %||% "Unknown",
+        air_data$pm10_avg %||% 0,
+        air_data$temperature_avg %||% 70,
+        (air_data$temperature_avg %||% 70 - 32) * 5/9,
+        air_data$humidity_avg %||% 50,
+        air_data$sensor_count %||% 0,
+        health_analysis,
+        self$get_health_risk_indicator(air_data$aqi %||% 0, air_data$aqi_category %||% "Unknown")
+      )
+    },
+    
+    # Fallback advice for address-based queries
+    generate_fallback_health_advice_address = function(address, user_profile = NULL, specific_question = NULL) {
+      fallback_context <- sprintf(
+        "=== GENERAL HEALTH CONSULTATION (ADDRESS-BASED) ===
+Search Address: %s
+Data Status: Real-time air quality data temporarily unavailable
+Consultation Time: %s
+
+Due to data unavailability, please provide general air quality health guidance including:
+1. Typical air quality concerns for this type of location
+2. General protective measures for residents
+3. When to check air quality before outdoor activities  
+4. Resources for real-time air quality monitoring",
+        address, format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      )
+      
+      if (!is.null(user_profile)) {
+        fallback_context <- paste0(fallback_context, sprintf(
+          "\n\nUser Profile: %s with %s",
+          user_profile$age_group %||% "General population",
+          user_profile$health_conditions %||% "no specified health conditions"
+        ))
+      }
+      
+      if (!is.null(specific_question)) {
+        fallback_context <- paste0(fallback_context, sprintf("\n\nSpecific Question: %s", specific_question))
+      }
+      
+      fallback_advice <- self$call_claude_api(
+        "You are Dr. Claude providing general air quality health guidance when real-time data is unavailable for an address-based query.",
+        fallback_context
+      )
+      
+      sprintf(
+        "🏥 ENHANCED HEALTHCARE AI AGENT - GENERAL HEALTH GUIDANCE
+════════════════════════════════════════════════════════════════════════════════
+🔍 Search Address: %s
+📅 Consultation Time: %s
+🤖 AI Health Advisor: %s
+⚠️ Data Status: Real-time air quality data temporarily unavailable
+
+🩺 DR. CLAUDE'S GENERAL HEALTH GUIDANCE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+%s
+
+💡 NEXT STEPS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Check your PurpleAir API key setup
+2. Verify geocoding service availability  
+3. Try again in a few minutes
+4. Use EPA AirNow for current conditions
+
+⚠️ DISCLAIMER: This is general guidance only.",
+        address, format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), self$agent_name, fallback_advice
+      )
+    }
+  )
+)
+
+# ============================== Convenience Functions ==============================
+
+# Main function: Get health recommendations by address
+get_health_recommendations_by_address <- function(address, user_profile = NULL, question = NULL, 
+                                                 search_radius_deg = 0.05) {
+  enhanced_agent <- EnhancedHealthcareAIAgent$new()
+  result <- enhanced_agent$analyze_health_impact_by_address(address, user_profile, question, search_radius_deg)
+  
+  if (is.character(result)) { 
+    cat(result) 
+    return(result) 
+  }
+  
+  cat(result$health_report)
+  return(result)
+}
+
+# Health consultation by address
+health_consultation_by_address <- function(address, question, search_radius_deg = 0.05) {
+  cat("═══════════════════════════════════════════════════════════════════════════════\n")
+  cat(sprintf("🩺 HEALTH CONSULTATION for Address: %s\n", address))
+  cat(sprintf("❓ Question: %s\n", question))
+  cat(sprintf("📍 Search Radius: %.2f degrees\n", search_radius_deg))
+  cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+  
+  get_health_recommendations_by_address(address, NULL, question, search_radius_deg)
+}
+
+# Quick health check by address
+quick_health_check_by_address <- function(address, question = NULL, search_radius_deg = 0.05) {
+  if (is.null(question)) {
+    question <- "What is the current health risk level and what activities are safe today?"
+  }
+  
+  enhanced_agent <- EnhancedHealthcareAIAgent$new()
+  result <- enhanced_agent$analyze_health_impact_by_address(address, NULL, question, search_radius_deg)
+  
+  if (!is.character(result)) {
+    cat(result$health_report)
+  } else {
+    cat(result)
+  }
+  
+  return(result)
+}
+
+# Enhanced AI health report with address support and preset profiles
+ai_health_report_by_address <- function(address,
+                                       profile_preset = c("general","pregnant","elderly","child","asthma","copd","athlete"),
+                                       question = NULL,
+                                       save_path = NULL,
+                                       verbose = TRUE,
+                                       search_radius_deg = 0.05) {
+  profile_preset <- match.arg(profile_preset)
+  
+  # Use your existing profile presets
+  if (exists(".profile_presets")) {
+    preset <- .profile_presets[[profile_preset]]
+    user_profile <- create_user_profile(
+      age_group        = preset$age_group,
+      health_conditions= preset$health_conditions,
+      sensitivities    = preset$sensitivities,
+      activity_level   = preset$activity_level,
+      special_notes    = sprintf("Preset: %s", profile_preset)
+    )
+  } else {
+    # Fallback profile creation
+    user_profile <- create_user_profile(
+      age_group = "Adult",
+      health_conditions = "None",
+      sensitivities = "None",
+      activity_level = "Normal",
+      special_notes = sprintf("Preset: %s", profile_preset)
+    )
+  }
+  
+  enhanced_agent <- EnhancedHealthcareAIAgent$new()
+  res <- enhanced_agent$analyze_health_impact_by_address(address, user_profile, question, search_radius_deg)
+  
+  if (is.list(res) && !is.null(res$health_report)) {
+    if (verbose) {
+      cat("\n━━━━━━━━ ADDRESS-BASED HEALTH REPORT ━━━━━━━━\n")
+      cat(res$health_report, "\n")
+    }
+    if (!is.null(save_path)) {
+      writeLines(res$health_report, con = save_path, useBytes = TRUE)
+      if (verbose) cat(sprintf("💾 Saved to: %s\n", normalizePath(save_path)))
+    }
+    return(invisible(res))
+  } else {
+    cat(res, "\n")
+    return(invisible(res))
+  }
+}
+
+# Enhanced demo function
+run_enhanced_demo <- function(demo_address = "116 Beechmont, Irvine, CA") {
+  cat("🎯 ENHANCED HEALTHCARE AI AGENT DEMO (ADDRESS-BASED)\n")
+  cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+  
+  if (!check_healthcare_setup()) {
+    cat("⚠️ Please complete setup first!\n")
+    return()
+  }
+  
+  cat("Demo 1: Basic Health Analysis by Address\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  result <- get_health_recommendations_by_address(demo_address)
+  
+  cat("\n\nDemo 2: Health Consultation by Address\n") 
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  consultation <- health_consultation_by_address(
+    demo_address, 
+    "Is it safe for elderly people to take walks in this area today?"
+  )
+  
+  cat("\n\nDemo 3: Profile-based Analysis\n")
+  cat("─────────────────────────────────────────────────────────────────────────────────\n")
+  profile_result <- ai_health_report_by_address(demo_address, "asthma", verbose = FALSE)
+  
+  return(list(basic = result, consultation = consultation, profile = profile_result))
+}
+
+# ============================== Setup and Info ==============================
+
+cat("\n🏥 ENHANCED HEALTHCARE AI AGENT (ADDRESS INTEGRATION) LOADED!\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("📋 Available Functions:\n")
+cat("🔹 get_health_recommendations_by_address('Your Address Here')\n")
+cat("🔹 health_consultation_by_address('Your Address', 'Your question')\n")
+cat("🔹 quick_health_check_by_address('Your Address')\n")
+cat("🔹 ai_health_report_by_address('Address', 'asthma') - With presets\n")
+cat("🔹 run_enhanced_demo() - Full demo with your address\n")
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+cat("💡 Example Usage:\n")
+cat('   result <- get_health_recommendations_by_address("700 W 9th St,Los Angeles,CA")\n')
+cat('   health_consultation_by_address("Your Address", "Is jogging safe today?")\n')
+cat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+```
+```{r}
+result <- get_health_recommendations_by_address("700 W 9th St,Los Angeles,CA")
+```
+# Part 3 - Agent Conversation"
+
+```{r}
+# ============================== 
+# Interactive Health AI Agent - Conversational Web Interface
+# ============================== 
+
+library(shiny)
+library(shinydashboard)
+library(shinyjs)
+library(httr)
+library(jsonlite)
+library(dplyr)
+
+# ============================== 
+# Conversation Manager Class
+# ============================== 
+
+ConversationalHealthAgent <- R6::R6Class("ConversationalHealthAgent",
+  inherit = EnhancedHealthcareAIAgent,
+  public = list(
+    conversation_history = NULL,
+    current_location = NULL,
+    current_air_data = NULL,
+    
+    initialize = function(...) {
+      super$initialize(...)
+      self$conversation_history <- list()
+      cat("💬 Conversational Health Agent initialized\n")
+    },
+    
+    # Add message to conversation history
+    add_to_history = function(role, content, metadata = NULL) {
+      entry <- list(
+        role = role,
+        content = content,
+        timestamp = Sys.time(),
+        metadata = metadata
+      )
+      self$conversation_history <- c(self$conversation_history, list(entry))
+    },
+    
+    # Chat with context awareness
+    chat = function(user_message, location = NULL, user_profile = NULL) {
+      # Update location if provided
+      if (!is.null(location)) {
+        self$current_location <- location
+        self$current_air_data <- self$fetch_latest_air_data(location)
+      }
+      
+      # Add user message to history
+      self$add_to_history("user", user_message)
+      
+      # Build contextual prompt
+      context <- self$build_conversation_context(user_profile)
+      
+      # Generate response
+      system_prompt <- sprintf(
+        "You are Dr. Claude, a conversational AI health advisor specializing in air quality and health. 
+You maintain context across conversations and provide personalized, actionable health guidance.
+Current location: %s
+Be conversational, empathetic, and concise. Focus on actionable advice.",
+        self$current_location %||% "Not specified"
+      )
+      
+      full_prompt <- paste(context, "\n\nUser:", user_message)
+      
+      response <- self$call_claude_api(system_prompt, full_prompt)
+      
+      # Add assistant response to history
+      self$add_to_history("assistant", response, 
+                         metadata = list(air_data = self$current_air_data))
+      
+      return(list(
+        response = response,
+        air_data = self$current_air_data,
+        timestamp = Sys.time()
+      ))
+    },
+    
+    # Fetch and cache air data
+    fetch_latest_air_data = function(location) {
+      tryCatch({
+        # Check if location is ZIP or address
+        if (grepl("^[0-9]{5}$", location)) {
+          get_air_quality_with_aqi(location)
+        } else {
+          get_air_quality_with_aqi_by_address(location)
+        }
+      }, error = function(e) {
+        cat(sprintf("⚠️ Could not fetch air data: %s\n", e$message))
+        NULL
+      })
+    },
+    
+    # Build conversation context
+    build_conversation_context = function(user_profile = NULL) {
+      parts <- list()
+      
+      # Air quality context
+      if (!is.null(self$current_air_data)) {
+        air_summary <- sprintf(
+          "Current Air Quality at %s:\n- PM2.5: %.1f μg/m³ (AQI: %d - %s)\n- Temperature: %.1f°F\n- Humidity: %.1f%%",
+          self$current_location,
+          self$current_air_data$pm25_avg,
+          self$current_air_data$aqi,
+          self$current_air_data$aqi_category,
+          self$current_air_data$temperature_avg,
+          self$current_air_data$humidity_avg
+        )
+        parts <- c(parts, air_summary)
+      }
+      
+      # User profile context
+      if (!is.null(user_profile)) {
+        profile_summary <- sprintf(
+          "User Profile:\n- Age: %s\n- Conditions: %s\n- Sensitivities: %s",
+          user_profile$age_group %||% "Not specified",
+          user_profile$health_conditions %||% "None",
+          user_profile$sensitivities %||% "None"
+        )
+        parts <- c(parts, profile_summary)
+      }
+      
+      # Recent conversation history (last 3 exchanges)
+      if (length(self$conversation_history) > 0) {
+        recent <- tail(self$conversation_history, 6)
+        history_text <- sapply(recent, function(x) {
+          sprintf("%s: %s", 
+                 if(x$role == "user") "User" else "Assistant",
+                 x$content)
+        })
+        parts <- c(parts, "Recent Conversation:", history_text)
+      }
+      
+      paste(parts, collapse = "\n")
+    },
+    
+    # Clear conversation
+    reset_conversation = function() {
+      self$conversation_history <- list()
+      cat("🔄 Conversation history cleared\n")
+    }
+  )
+)
+
+# ============================== 
+# Shiny UI
+# ============================== 
+
+ui <- dashboardPage(
+  skin = "blue",
+  
+  dashboardHeader(
+    title = "🏥 Dr. Claude - AI Health Advisor",
+    titleWidth = 350
+  ),
+  
+  dashboardSidebar(
+    width = 300,
+    sidebarMenu(
+      menuItem("💬 Chat", tabName = "chat", icon = icon("comments")),
+      menuItem("📍 Location", tabName = "location", icon = icon("map-marker-alt")),
+      menuItem("👤 Profile", tabName = "profile", icon = icon("user"))
+    ),
+    
+    hr(),
+    
+    # Quick location input in sidebar
+    textInput("quick_location", "📍 Location (ZIP/Address)", 
+             placeholder = "90210 or 123 Main St"),
+    actionButton("update_location_btn", "Update Location", 
+                class = "btn-primary btn-block"),
+    
+    hr(),
+    
+    # Current conditions display
+    h4("Current Conditions", style = "padding-left: 15px;"),
+    uiOutput("sidebar_conditions")
+  ),
+  
+  dashboardBody(
+    useShinyjs(),
+    
+    tags$head(
+      tags$style(HTML("
+        .chat-container {
+          height: 600px;
+          overflow-y: auto;
+          padding: 20px;
+          background-color: #f5f5f5;
+          border-radius: 10px;
+        }
+        
+        .message {
+          margin-bottom: 15px;
+          padding: 12px 16px;
+          border-radius: 18px;
+          max-width: 80%;
+          word-wrap: break-word;
+        }
+        
+        .user-message {
+          background-color: #007bff;
+          color: white;
+          margin-left: auto;
+          text-align: right;
+        }
+        
+        .assistant-message {
+          background-color: white;
+          color: #333;
+          border: 1px solid #ddd;
+          margin-right: auto;
+        }
+        
+        .timestamp {
+          font-size: 0.75em;
+          color: #999;
+          margin-top: 5px;
+        }
+        
+        .input-container {
+          position: sticky;
+          bottom: 0;
+          background: white;
+          padding: 15px;
+          border-top: 2px solid #ddd;
+        }
+        
+        .aqi-badge {
+          display: inline-block;
+          padding: 4px 8px;
+          border-radius: 4px;
+          font-weight: bold;
+          font-size: 0.9em;
+        }
+        
+        .aqi-good { background-color: #00e400; color: white; }
+        .aqi-moderate { background-color: #ffff00; color: black; }
+        .aqi-unhealthy-sensitive { background-color: #ff7e00; color: white; }
+        .aqi-unhealthy { background-color: #ff0000; color: white; }
+        .aqi-very-unhealthy { background-color: #8f3f97; color: white; }
+        .aqi-hazardous { background-color: #7e0023; color: white; }
+      "))
+    ),
+    
+    tabItems(
+      # Chat Tab
+      tabItem(
+        tabName = "chat",
+        fluidRow(
+          box(
+            width = 12,
+            title = "💬 Conversation with Dr. Claude",
+            status = "primary",
+            solidHeader = TRUE,
+            
+            div(
+              class = "chat-container",
+              id = "chat_messages",
+              uiOutput("chat_display")
+            ),
+            
+            div(
+              class = "input-container",
+              fluidRow(
+                column(10,
+                  textInput("user_input", NULL, 
+                           placeholder = "Ask about air quality, health advice, outdoor activities...",
+                           width = "100%")
+                ),
+                column(2,
+                  actionButton("send_btn", "Send", 
+                             class = "btn-primary btn-block",
+                             icon = icon("paper-plane"))
+                )
+              ),
+              fluidRow(
+                column(12,
+                  actionButton("clear_chat_btn", "Clear Chat", 
+                             class = "btn-warning btn-sm",
+                             icon = icon("eraser"))
+                )
+              )
+            )
+          )
+        )
+      ),
+      
+      # Location Tab
+      tabItem(
+        tabName = "location",
+        fluidRow(
+          box(
+            width = 12,
+            title = "📍 Location Settings",
+            status = "info",
+            solidHeader = TRUE,
+            
+            textInput("location_input", "Enter ZIP Code or Address",
+                     placeholder = "e.g., 90210 or 123 Main St, Los Angeles, CA"),
+            
+            actionButton("set_location_btn", "Set Location", 
+                        class = "btn-success"),
+            
+            hr(),
+            
+            h4("Current Location Information"),
+            verbatimTextOutput("location_info"),
+            
+            h4("Real-time Air Quality Data"),
+            uiOutput("air_quality_display")
+          )
+        )
+      ),
+      
+      # Profile Tab
+      tabItem(
+        tabName = "profile",
+        fluidRow(
+          box(
+            width = 12,
+            title = "👤 User Health Profile",
+            status = "warning",
+            solidHeader = TRUE,
+            
+            selectInput("age_group", "Age Group",
+                       choices = c("Child", "Adult", "Elderly", "Pregnant"),
+                       selected = "Adult"),
+            
+            textInput("health_conditions", "Health Conditions",
+                     placeholder = "e.g., Asthma, COPD, Heart disease"),
+            
+            textInput("sensitivities", "Respiratory Sensitivities",
+                     placeholder = "e.g., PM2.5, Smoke, Pollen"),
+            
+            selectInput("activity_level", "Activity Level",
+                       choices = c("Light", "Normal", "Moderate", "Vigorous"),
+                       selected = "Normal"),
+            
+            textAreaInput("special_notes", "Special Notes",
+                         placeholder = "Any other health information to consider..."),
+            
+            actionButton("save_profile_btn", "Save Profile", 
+                        class = "btn-success"),
+            
+            hr(),
+            
+            h4("Current Profile"),
+            verbatimTextOutput("profile_display")
+          )
+        )
+      )
+    )
+  )
+)
+
+# ============================== 
+# Shiny Server
+# ============================== 
+
+server <- function(input, output, session) {
+  
+  # Initialize conversational agent
+  agent <- ConversationalHealthAgent$new()
+  
+  # Reactive values
+  rv <- reactiveValues(
+    messages = list(),
+    current_location = NULL,
+    air_data = NULL,
+    user_profile = NULL
+  )
+  
+  # Update location
+  observeEvent(input$update_location_btn, {
+    req(input$quick_location)
+    
+    showNotification("Fetching location data...", type = "message")
+    
+    rv$current_location <- input$quick_location
+    rv$air_data <- agent$fetch_latest_air_data(input$quick_location)
+    
+    if (!is.null(rv$air_data)) {
+      showNotification("✅ Location updated successfully!", type = "message")
+    } else {
+      showNotification("⚠️ Could not fetch air quality data", type = "warning")
+    }
+  })
+  
+  # Set location from location tab
+  observeEvent(input$set_location_btn, {
+    req(input$location_input)
+    updateTextInput(session, "quick_location", value = input$location_input)
+    click("update_location_btn")
+  })
+  
+  # Save user profile
+  observeEvent(input$save_profile_btn, {
+    rv$user_profile <- list(
+      age_group = input$age_group,
+      health_conditions = input$health_conditions,
+      sensitivities = input$sensitivities,
+      activity_level = input$activity_level,
+      special_notes = input$special_notes
+    )
+    showNotification("✅ Profile saved!", type = "message")
+  })
+  
+  # Send message
+  observeEvent(input$send_btn, {
+    req(input$user_input)
+    
+    user_msg <- input$user_input
+    
+    # Add user message
+    rv$messages <- c(rv$messages, list(list(
+      role = "user",
+      content = user_msg,
+      timestamp = Sys.time()
+    )))
+    
+    # Clear input
+    updateTextInput(session, "user_input", value = "")
+    
+    # Get AI response
+    showNotification("Dr. Claude is thinking...", type = "message", duration = 2)
+    
+    result <- agent$chat(
+      user_message = user_msg,
+      location = rv$current_location,
+      user_profile = rv$user_profile
+    )
+    
+    # Add assistant response
+    rv$messages <- c(rv$messages, list(list(
+      role = "assistant",
+      content = result$response,
+      timestamp = result$timestamp,
+      air_data = result$air_data
+    )))
+    
+    # Update air data
+    if (!is.null(result$air_data)) {
+      rv$air_data <- result$air_data
+    }
+  })
+  
+  # Allow Enter key to send
+  observeEvent(input$user_input, {
+    if (grepl("\n$", input$user_input)) {
+      click("send_btn")
+    }
+  })
+  
+  # Clear chat
+  observeEvent(input$clear_chat_btn, {
+    rv$messages <- list()
+    agent$reset_conversation()
+    showNotification("🔄 Chat cleared", type = "message")
+  })
+  
+  # Render chat messages
+  output$chat_display <- renderUI({
+    if (length(rv$messages) == 0) {
+      return(div(
+        style = "text-align: center; padding: 50px; color: #999;",
+        h3("👋 Hello! I'm Dr. Claude"),
+        p("Ask me about air quality and health recommendations for your area."),
+        p("Start by setting your location in the sidebar.")
+      ))
+    }
+    
+    message_divs <- lapply(rv$messages, function(msg) {
+      class_name <- if (msg$role == "user") "message user-message" else "message assistant-message"
+      
+      div(
+        class = class_name,
+        p(msg$content),
+        div(class = "timestamp", format(msg$timestamp, "%I:%M %p"))
+      )
+    })
+    
+    tagList(message_divs)
+  })
+  
+  # Sidebar conditions display
+  output$sidebar_conditions <- renderUI({
+    if (is.null(rv$air_data)) {
+      return(p("No location set", style = "padding-left: 15px; color: #999;"))
+    }
+    
+    aqi_class <- switch(rv$air_data$aqi_category,
+      "Good" = "aqi-good",
+      "Moderate" = "aqi-moderate",
+      "Unhealthy for Sensitive Groups" = "aqi-unhealthy-sensitive",
+      "Unhealthy" = "aqi-unhealthy",
+      "Very Unhealthy" = "aqi-very-unhealthy",
+      "Hazardous" = "aqi-hazardous",
+      ""
+    )
+    
+    div(
+      style = "padding-left: 15px;",
+      p(strong("Location:"), br(), rv$current_location),
+      p(
+        strong("AQI:"), br(),
+        span(class = paste("aqi-badge", aqi_class), 
+             sprintf("%d - %s", rv$air_data$aqi, rv$air_data$aqi_category))
+      ),
+      p(strong("PM2.5:"), sprintf("%.1f μg/m³", rv$air_data$pm25_avg)),
+      p(strong("Temp:"), sprintf("%.1f°F", rv$air_data$temperature_avg))
+    )
+  })
+  
+  # Location info display
+  output$location_info <- renderText({
+    if (is.null(rv$current_location)) {
+      return("No location set")
+    }
+    paste("Current Location:", rv$current_location)
+  })
+  
+  # Air quality detailed display
+  output$air_quality_display <- renderUI({
+    if (is.null(rv$air_data)) {
+      return(p("Set a location to view air quality data"))
+    }
+    
+    aqi_class <- switch(rv$air_data$aqi_category,
+      "Good" = "aqi-good",
+      "Moderate" = "aqi-moderate",
+      "Unhealthy for Sensitive Groups" = "aqi-unhealthy-sensitive",
+      "Unhealthy" = "aqi-unhealthy",
+      "Very Unhealthy" = "aqi-very-unhealthy",
+      "Hazardous" = "aqi-hazardous",
+      ""
+    )
+    
+    div(
+      h4(span(class = paste("aqi-badge", aqi_class), 
+             sprintf("AQI: %d - %s", rv$air_data$aqi, rv$air_data$aqi_category))),
+      p(strong("PM2.5:"), sprintf("%.1f μg/m³", rv$air_data$pm25_avg)),
+      p(strong("PM10:"), sprintf("%.1f μg/m³", rv$air_data$pm10_avg)),
+      p(strong("Temperature:"), sprintf("%.1f°F", rv$air_data$temperature_avg)),
+      p(strong("Humidity:"), sprintf("%.1f%%", rv$air_data$humidity_avg)),
+      p(strong("Sensors:"), rv$air_data$sensor_count)
+    )
+  })
+  
+  # Profile display
+  output$profile_display <- renderText({
+    if (is.null(rv$user_profile)) {
+      return("No profile saved yet")
+    }
+    
+    paste(
+      sprintf("Age Group: %s", rv$user_profile$age_group),
+      sprintf("Health Conditions: %s", rv$user_profile$health_conditions),
+      sprintf("Sensitivities: %s", rv$user_profile$sensitivities),
+      sprintf("Activity Level: %s", rv$user_profile$activity_level),
+      sprintf("Notes: %s", rv$user_profile$special_notes),
+      sep = "\n"
+    )
+  })
+}
+
+# Run App
+# ============================== 
+
+shinyApp(ui = ui, server = server)
+```
