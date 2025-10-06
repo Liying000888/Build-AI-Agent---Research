@@ -4,7 +4,8 @@ output: html_document
 date: "2025-10-06"
 ---
 
-## please run the key Before Run the AI agent coding##
+## 1. please run the key Before Run the AI agent coding# 
+# 2. change the file as ".Renviron" #
 
 ANTHROPIC_API_KEY= #download the API key from Claude#
 PURPLEAIR_API_KEY= #download the API key from purple air#
